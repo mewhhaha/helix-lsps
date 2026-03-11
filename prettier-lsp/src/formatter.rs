@@ -20,7 +20,12 @@ const PRETTIER_BRIDGE: &str = include_str!("prettier_bridge.mjs");
 
 #[async_trait]
 pub trait Formatter: Send + Sync {
-    async fn format(&self, file_path: &Path, source: &str) -> Result<FormatOutcome, FormatError>;
+    async fn format(
+        &self,
+        file_path: &Path,
+        source: &str,
+        workspace_root: Option<&Path>,
+    ) -> Result<FormatOutcome, FormatError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +115,7 @@ enum NodeBridgeResponse {
 struct NodeBridgeRequest<'a> {
     file_path: &'a Path,
     source: &'a str,
+    workspace_root: Option<&'a Path>,
 }
 
 #[derive(Debug)]
@@ -164,9 +170,14 @@ impl WorkspaceWorker {
         &self,
         file_path: &Path,
         source: &str,
+        workspace_root: Option<&Path>,
     ) -> Result<NodeBridgeResponse, FormatError> {
-        let payload = serde_json::to_string(&NodeBridgeRequest { file_path, source })
-            .map_err(|error| FormatError::new(format!("failed to serialize request: {error}")))?;
+        let payload = serde_json::to_string(&NodeBridgeRequest {
+            file_path,
+            source,
+            workspace_root,
+        })
+        .map_err(|error| FormatError::new(format!("failed to serialize request: {error}")))?;
 
         let mut state = self.state.lock().await;
         state
@@ -203,10 +214,15 @@ impl WorkspaceWorker {
 
 #[async_trait]
 impl Formatter for NodePrettierFormatter {
-    async fn format(&self, file_path: &Path, source: &str) -> Result<FormatOutcome, FormatError> {
-        let workspace_dir = resolve_workspace_dir(file_path);
+    async fn format(
+        &self,
+        file_path: &Path,
+        source: &str,
+        workspace_root: Option<&Path>,
+    ) -> Result<FormatOutcome, FormatError> {
+        let workspace_dir = resolve_workspace_dir(file_path, workspace_root);
         let worker = self.worker_for(&workspace_dir).await?;
-        let response = worker.request(file_path, source).await;
+        let response = worker.request(file_path, source, workspace_root).await;
 
         let response = match response {
             Ok(response) => response,
@@ -227,14 +243,27 @@ impl Formatter for NodePrettierFormatter {
     }
 }
 
-fn resolve_workspace_dir(file_path: &Path) -> PathBuf {
+fn resolve_workspace_dir(file_path: &Path, workspace_root: Option<&Path>) -> PathBuf {
     let parent = file_path.parent().unwrap_or_else(|| Path::new("."));
+
+    if let Some(workspace_root) = workspace_root.filter(|root| parent.starts_with(root)) {
+        return parent
+            .ancestors()
+            .take_while(|path| path.starts_with(workspace_root))
+            .find(|path| is_workspace_boundary(path))
+            .unwrap_or(workspace_root)
+            .to_path_buf();
+    }
 
     parent
         .ancestors()
-        .find(|path| path.join("package.json").is_file() || path.join("node_modules").is_dir())
+        .find(|path| is_workspace_boundary(path))
         .unwrap_or(parent)
         .to_path_buf()
+}
+
+fn is_workspace_boundary(path: &Path) -> bool {
+    path.join("package.json").is_file() || path.join("node_modules").is_dir()
 }
 
 #[cfg(test)]
@@ -255,7 +284,27 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolve_workspace_dir(&nested.join("example.js")), workspace);
+        assert_eq!(
+            resolve_workspace_dir(&nested.join("example.js"), Some(&workspace)),
+            workspace
+        );
+    }
+
+    #[test]
+    fn stops_searching_at_the_initialized_workspace_root() {
+        let temp_dir = tempdir().unwrap();
+        let outer = temp_dir.path().join("outer");
+        let workspace = outer.join("workspace");
+        let nested = workspace.join("src/nested");
+
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(outer.join("node_modules")).unwrap();
+        fs::write(outer.join("package.json"), "{\n  \"private\": true\n}\n").unwrap();
+
+        assert_eq!(
+            resolve_workspace_dir(&nested.join("example.js"), Some(&workspace)),
+            workspace
+        );
     }
 
     #[tokio::test]
@@ -287,8 +336,14 @@ mod tests {
         let formatter = NodePrettierFormatter::new(&wrapper_path);
         let source = "const answer={value:\"forty two\"}\n";
 
-        formatter.format(&file_path, source).await.unwrap();
-        formatter.format(&file_path, source).await.unwrap();
+        formatter
+            .format(&file_path, source, Some(&workspace))
+            .await
+            .unwrap();
+        formatter
+            .format(&file_path, source, Some(&workspace))
+            .await
+            .unwrap();
 
         let counter = fs::read_to_string(counter_path).unwrap();
         assert_eq!(counter.lines().count(), 1);

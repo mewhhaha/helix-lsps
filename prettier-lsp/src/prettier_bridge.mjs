@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import process from "node:process";
 import readline from "node:readline";
@@ -11,10 +11,50 @@ function writeResponse(payload) {
   process.stdout.write(`${JSON.stringify(payload)}\n`);
 }
 
-async function loadPrettier(targetFilePath) {
-  const resolved = require.resolve("prettier", {
-    paths: [dirname(targetFilePath)],
-  });
+function isWithinRoot(workspaceRoot, targetPath) {
+  if (!workspaceRoot) {
+    return false;
+  }
+
+  const relativePath = relative(workspaceRoot, targetPath);
+  return (
+    relativePath === "" ||
+    (!relativePath.startsWith("..") && !isAbsolute(relativePath))
+  );
+}
+
+function resolvePrettier(targetFilePath, workspaceRoot) {
+  const stopDir = isWithinRoot(workspaceRoot, targetFilePath)
+    ? workspaceRoot
+    : null;
+
+  let currentDir = dirname(targetFilePath);
+  let lastError;
+
+  while (true) {
+    try {
+      return require.resolve(join(currentDir, "node_modules", "prettier"));
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (stopDir && currentDir === stopDir) {
+      break;
+    }
+
+    const parentDir = dirname(currentDir);
+    if (parentDir === currentDir) {
+      break;
+    }
+
+    currentDir = parentDir;
+  }
+
+  throw lastError ?? new Error(`could not resolve prettier for ${targetFilePath}`);
+}
+
+async function loadPrettier(targetFilePath, workspaceRoot) {
+  const resolved = resolvePrettier(targetFilePath, workspaceRoot);
 
   let prettier = prettierCache.get(resolved);
   if (!prettier) {
@@ -35,7 +75,7 @@ function formatError(code, error) {
 }
 
 async function handleRequest(request) {
-  const { file_path: filePath, source } = request;
+  const { file_path: filePath, source, workspace_root: workspaceRoot } = request;
 
   if (!filePath || typeof source !== "string") {
     return formatError("invalid_request", "expected file_path and source");
@@ -44,7 +84,7 @@ async function handleRequest(request) {
   let prettier;
 
   try {
-    prettier = await loadPrettier(filePath);
+    prettier = await loadPrettier(filePath, workspaceRoot);
   } catch (error) {
     return formatError("missing_prettier", error);
   }

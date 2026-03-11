@@ -67,6 +67,13 @@ pub struct ProjectContext {
     pub eslint_package_json: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectRoots {
+    cwd: PathBuf,
+    config_format: ConfigFormat,
+    eslint_resolution_dir: PathBuf,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ProjectKey {
     cwd: PathBuf,
@@ -140,12 +147,14 @@ impl Resolver {
             )
         })?;
 
-        let (cwd, config_format) = discover_cwd(file_dir)?;
-        let eslint_package_json = self.resolve_eslint_package_json(&cwd).await?;
+        let roots = discover_project_roots(file_dir)?;
+        let eslint_package_json = self
+            .resolve_eslint_package_json(&roots.eslint_resolution_dir)
+            .await?;
 
         Ok(ProjectContext {
-            cwd,
-            config_format,
+            cwd: roots.cwd,
+            config_format: roots.config_format,
             eslint_package_json,
         })
     }
@@ -342,29 +351,42 @@ fn format_bridge_error(stderr: &str) -> String {
     format!("ESLint failed while evaluating the local project setup: {summary}")
 }
 
-fn discover_cwd(start_dir: &Path) -> Result<(PathBuf, ConfigFormat)> {
-    let mut fallback_package_dir = None;
+fn discover_project_roots(start_dir: &Path) -> Result<ProjectRoots> {
+    let mut nearest_package_dir = None;
 
     for candidate in start_dir.ancestors() {
+        if nearest_package_dir.is_none() && candidate.join("package.json").exists() {
+            nearest_package_dir = Some(candidate.to_path_buf());
+        }
+
         if contains_any(candidate, FLAT_CONFIG_NAMES) {
-            return Ok((candidate.to_path_buf(), ConfigFormat::Flat));
+            return Ok(ProjectRoots {
+                cwd: candidate.to_path_buf(),
+                config_format: ConfigFormat::Flat,
+                eslint_resolution_dir: nearest_package_dir
+                    .unwrap_or_else(|| candidate.to_path_buf()),
+            });
         }
 
         if contains_any(candidate, LEGACY_CONFIG_NAMES)
             || package_json_has_eslint_config(candidate)?
         {
-            return Ok((candidate.to_path_buf(), ConfigFormat::Eslintrc));
-        }
-
-        if fallback_package_dir.is_none() && candidate.join("package.json").exists() {
-            fallback_package_dir = Some(candidate.to_path_buf());
+            return Ok(ProjectRoots {
+                cwd: candidate.to_path_buf(),
+                config_format: ConfigFormat::Eslintrc,
+                eslint_resolution_dir: nearest_package_dir
+                    .unwrap_or_else(|| candidate.to_path_buf()),
+            });
         }
     }
 
-    Ok((
-        fallback_package_dir.unwrap_or_else(|| start_dir.to_path_buf()),
-        ConfigFormat::Default,
-    ))
+    let fallback_dir = nearest_package_dir.unwrap_or_else(|| start_dir.to_path_buf());
+
+    Ok(ProjectRoots {
+        cwd: fallback_dir.clone(),
+        config_format: ConfigFormat::Default,
+        eslint_resolution_dir: fallback_dir,
+    })
 }
 
 fn contains_any(dir: &Path, names: &[&str]) -> bool {
@@ -391,7 +413,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ConfigFormat, discover_cwd, format_bridge_error};
+    use super::{ConfigFormat, discover_project_roots, format_bridge_error};
 
     #[test]
     fn prefers_nearest_flat_config() {
@@ -401,9 +423,10 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(root.join("eslint.config.mjs"), "export default [];").unwrap();
 
-        let (cwd, format) = discover_cwd(&nested).unwrap();
-        assert_eq!(cwd, root);
-        assert_eq!(format, ConfigFormat::Flat);
+        let roots = discover_project_roots(&nested).unwrap();
+        assert_eq!(roots.cwd, root);
+        assert_eq!(roots.config_format, ConfigFormat::Flat);
+        assert_eq!(roots.eslint_resolution_dir, root);
     }
 
     #[test]
@@ -414,9 +437,10 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(root.join("package.json"), r#"{"name":"fixture"}"#).unwrap();
 
-        let (cwd, format) = discover_cwd(&nested).unwrap();
-        assert_eq!(cwd, root);
-        assert_eq!(format, ConfigFormat::Default);
+        let roots = discover_project_roots(&nested).unwrap();
+        assert_eq!(roots.cwd, root);
+        assert_eq!(roots.config_format, ConfigFormat::Default);
+        assert_eq!(roots.eslint_resolution_dir, root);
     }
 
     #[test]
@@ -431,9 +455,27 @@ mod tests {
         )
         .unwrap();
 
-        let (cwd, format) = discover_cwd(&nested).unwrap();
-        assert_eq!(cwd, root);
-        assert_eq!(format, ConfigFormat::Eslintrc);
+        let roots = discover_project_roots(&nested).unwrap();
+        assert_eq!(roots.cwd, root);
+        assert_eq!(roots.config_format, ConfigFormat::Eslintrc);
+        assert_eq!(roots.eslint_resolution_dir, root);
+    }
+
+    #[test]
+    fn keeps_root_config_but_resolves_eslint_from_nearest_package() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let package = root.join("packages/app");
+        let nested = package.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("package.json"), r#"{"name":"workspace","private":true,"workspaces":["packages/*"]}"#).unwrap();
+        fs::write(root.join("eslint.config.mjs"), "export default [];").unwrap();
+        fs::write(package.join("package.json"), r#"{"name":"app"}"#).unwrap();
+
+        let roots = discover_project_roots(&nested).unwrap();
+        assert_eq!(roots.cwd, root);
+        assert_eq!(roots.config_format, ConfigFormat::Flat);
+        assert_eq!(roots.eslint_resolution_dir, package);
     }
 
     #[test]

@@ -1,133 +1,16 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createLspHarness } from "./lsp-harness.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fixtureRoot = await mkdtemp(path.join(tmpdir(), "eslint-lsp-smoke-"));
 const workerStateFile = path.join(fixtureRoot, "eslint-worker-state.json");
 const targetFile = path.join(fixtureRoot, "src", "example.js");
-
-const state = {
-  nextId: 1,
-  pending: new Map(),
-  diagnostics: [],
-  appliedEdits: [],
-};
-
-function encodeMessage(message) {
-  const body = Buffer.from(JSON.stringify(message), "utf8");
-  return Buffer.concat([
-    Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "utf8"),
-    body,
-  ]);
-}
-
-function send(server, message) {
-  server.stdin.write(encodeMessage(message));
-}
-
-function request(server, method, params) {
-  const id = state.nextId++;
-  const promise = new Promise((resolve, reject) => {
-    state.pending.set(id, { resolve, reject });
-  });
-
-  const message = { jsonrpc: "2.0", id, method };
-  if (params !== undefined) {
-    message.params = params;
-  }
-
-  send(server, message);
-  return promise;
-}
-
-function installProtocolParser(server) {
-  let buffer = Buffer.alloc(0);
-
-  server.stdout.on("data", (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-
-    while (true) {
-      const delimiterIndex = buffer.indexOf("\r\n\r\n");
-      if (delimiterIndex === -1) {
-        return;
-      }
-
-      const header = buffer.slice(0, delimiterIndex).toString("utf8");
-      const match = header.match(/Content-Length: (\d+)/i);
-      if (!match) {
-        throw new Error(`missing content length in header: ${header}`);
-      }
-
-      const contentLength = Number(match[1]);
-      const messageEnd = delimiterIndex + 4 + contentLength;
-      if (buffer.length < messageEnd) {
-        return;
-      }
-
-      const payload = buffer
-        .slice(delimiterIndex + 4, messageEnd)
-        .toString("utf8");
-      buffer = buffer.slice(messageEnd);
-
-      handleServerMessage(JSON.parse(payload));
-    }
-  });
-}
-
-function handleServerMessage(message) {
-  if (typeof message.id === "number" && state.pending.has(message.id)) {
-    const pending = state.pending.get(message.id);
-    state.pending.delete(message.id);
-
-    if (message.error) {
-      pending.reject(new Error(JSON.stringify(message.error)));
-    } else {
-      pending.resolve(message.result);
-    }
-    return;
-  }
-
-  if (message.method === "textDocument/publishDiagnostics") {
-    state.diagnostics.push(message.params);
-    return;
-  }
-
-  if (message.method === "workspace/applyEdit") {
-    state.appliedEdits.push(message.params.edit);
-    send(serverRef, {
-      jsonrpc: "2.0",
-      id: message.id,
-      result: { applied: true },
-    });
-  }
-}
-
-let serverRef;
-
-function waitForDiagnostics(uri) {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error("timed out waiting for publishDiagnostics"));
-    }, 20000);
-
-    const interval = setInterval(() => {
-      const hit = state.diagnostics.find((entry) => entry.uri === uri);
-      if (!hit) {
-        return;
-      }
-
-      clearInterval(interval);
-      clearTimeout(timeout);
-      resolve(hit);
-    }, 50);
-  });
-}
 
 async function setupFixture() {
   await mkdir(path.join(fixtureRoot, "src"), { recursive: true });
@@ -225,21 +108,15 @@ module.exports = {
 async function main() {
   await setupFixture();
 
-  const server = spawn("cargo", ["run", "--quiet"], {
-    cwd: repoRoot,
-    env: {
-      ...process.env,
-      CARGO_HOME: path.join(tmpdir(), "eslint-lsp-cargo-home"),
-    },
-    stdio: ["pipe", "pipe", "inherit"],
+  const harness = createLspHarness({
+    repoRoot,
+    captureApplyEdits: true,
   });
-  serverRef = server;
-  installProtocolParser(server);
 
   const rootUri = pathToFileURL(fixtureRoot).href;
   const documentUri = pathToFileURL(targetFile).href;
 
-  const init = await request(server, "initialize", {
+  const init = await harness.request("initialize", {
     processId: process.pid,
     rootUri,
     capabilities: {
@@ -252,8 +129,8 @@ async function main() {
 
   assert.equal(init.serverInfo?.name, "eslint-lsp");
 
-  send(server, { jsonrpc: "2.0", method: "initialized", params: {} });
-  send(server, {
+  harness.send({ jsonrpc: "2.0", method: "initialized", params: {} });
+  harness.send({
     jsonrpc: "2.0",
     method: "textDocument/didOpen",
     params: {
@@ -266,12 +143,12 @@ async function main() {
     },
   });
 
-  const diagnostics = await waitForDiagnostics(documentUri);
+  const diagnostics = await harness.waitForDiagnostics(documentUri);
   assert.equal(diagnostics.diagnostics.length, 1);
   assert.equal(diagnostics.diagnostics[0].code, "semi");
 
   const actions = await Promise.race([
-    request(server, "textDocument/codeAction", {
+    harness.request("textDocument/codeAction", {
       textDocument: { uri: documentUri },
       range: {
         start: { line: 0, character: 0 },
@@ -292,18 +169,18 @@ async function main() {
   assert.ok(fixAll, "expected source.fixAll.eslint code action");
   assert.equal(fixAll.command?.command, "eslint.applyFixAll");
 
-  await request(server, "workspace/executeCommand", {
+  await harness.request("workspace/executeCommand", {
     command: fixAll.command.command,
     arguments: fixAll.command.arguments,
   });
 
-  assert.equal(state.appliedEdits.length, 1);
+  assert.equal(harness.state.appliedEdits.length, 1);
   assert.equal(
-    state.appliedEdits[0].changes[documentUri][0].newText,
+    harness.state.appliedEdits[0].changes[documentUri][0].newText,
     "const answer = 42;\n",
   );
 
-  const unrelatedActions = await request(server, "textDocument/codeAction", {
+  const unrelatedActions = await harness.request("textDocument/codeAction", {
     textDocument: { uri: documentUri },
     range: {
       start: { line: 0, character: 0 },
@@ -317,7 +194,7 @@ async function main() {
 
   assert.ok(!unrelatedActions || unrelatedActions.length === 0);
 
-  const formatting = await request(server, "textDocument/formatting", {
+  const formatting = await harness.request("textDocument/formatting", {
     textDocument: { uri: documentUri },
     options: { tabSize: 2, insertSpaces: true },
   });
@@ -331,8 +208,7 @@ async function main() {
     constructors: 2,
   });
 
-  await request(server, "shutdown");
-  send(server, { jsonrpc: "2.0", method: "exit" });
+  await harness.shutdown();
 
   console.log("smoke harness passed");
 }
