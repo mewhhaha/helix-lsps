@@ -1,0 +1,16 @@
+[package]
+name = "tsgo-lsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+lsp-server = "0.7"
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3.20"

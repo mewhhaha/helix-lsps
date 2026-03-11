@@ -1,0 +1,7 @@
+{
+  "name": "prettier-lsp-harness",
+  "private": true,
+  "devDependencies": {
+    "prettier": "^3.0.0"
+  }
+}
