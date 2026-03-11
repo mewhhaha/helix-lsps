@@ -151,6 +151,10 @@ impl LanguageServer for Backend {
             }
             Ok(FormatOutcome::Ignored | FormatOutcome::Unsupported) => Ok(Some(Vec::new())),
             Err(error) => {
+                if error.is_unavailable() {
+                    return Ok(Some(Vec::new()));
+                }
+
                 let message = error.to_string();
                 error!("formatting failed for {}: {message}", file_path.display());
                 self.client.show_message(MessageType::ERROR, message).await;

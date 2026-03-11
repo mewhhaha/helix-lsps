@@ -38,13 +38,26 @@ pub enum FormatOutcome {
 #[derive(Debug, Clone)]
 pub struct FormatError {
     message: String,
+    unavailable: bool,
 }
 
 impl FormatError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            unavailable: false,
         }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            unavailable: true,
+        }
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        self.unavailable
     }
 }
 
@@ -143,7 +156,14 @@ impl WorkspaceWorker {
             .kill_on_drop(true)
             .spawn()
             .map_err(|error| {
-                FormatError::new(format!("failed to spawn {:?}: {error}", node_binary))
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    FormatError::unavailable(format!(
+                        "failed to spawn {:?}: {error}",
+                        node_binary
+                    ))
+                } else {
+                    FormatError::new(format!("failed to spawn {:?}: {error}", node_binary))
+                }
             })?;
 
         let stdin = child
@@ -232,13 +252,20 @@ impl Formatter for NodePrettierFormatter {
             }
         };
 
-        match response {
-            NodeBridgeResponse::Formatted { formatted } => Ok(FormatOutcome::Formatted(formatted)),
-            NodeBridgeResponse::Ignored => Ok(FormatOutcome::Ignored),
-            NodeBridgeResponse::Unsupported => Ok(FormatOutcome::Unsupported),
-            NodeBridgeResponse::Error { code, message } => {
-                Err(FormatError::new(format!("{code}: {message}")))
-            }
+        map_response(response)
+    }
+}
+
+fn map_response(response: NodeBridgeResponse) -> Result<FormatOutcome, FormatError> {
+    match response {
+        NodeBridgeResponse::Formatted { formatted } => Ok(FormatOutcome::Formatted(formatted)),
+        NodeBridgeResponse::Ignored => Ok(FormatOutcome::Ignored),
+        NodeBridgeResponse::Unsupported => Ok(FormatOutcome::Unsupported),
+        NodeBridgeResponse::Error { code, message } if code == "missing_prettier" => {
+            Err(FormatError::unavailable(format!("{code}: {message}")))
+        }
+        NodeBridgeResponse::Error { code, message } => {
+            Err(FormatError::new(format!("{code}: {message}")))
         }
     }
 }
@@ -268,7 +295,7 @@ fn is_workspace_boundary(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Formatter, NodePrettierFormatter, resolve_workspace_dir};
+    use super::{Formatter, NodeBridgeResponse, NodePrettierFormatter, map_response, resolve_workspace_dir};
     use std::{fs, os::unix::fs::PermissionsExt, path::Path};
     use tempfile::{tempdir, tempdir_in};
 
@@ -347,5 +374,28 @@ mod tests {
 
         let counter = fs::read_to_string(counter_path).unwrap();
         assert_eq!(counter.lines().count(), 1);
+    }
+
+    #[test]
+    fn marks_missing_prettier_as_unavailable() {
+        let error = map_response(NodeBridgeResponse::Error {
+            code: "missing_prettier".into(),
+            message: "not found".into(),
+        })
+        .unwrap_err();
+
+        assert!(error.is_unavailable());
+    }
+
+    #[test]
+    fn keeps_other_prettier_errors_loud() {
+        let error = map_response(NodeBridgeResponse::Error {
+            code: "prettier_error".into(),
+            message: "boom".into(),
+        })
+        .unwrap_err();
+
+        assert!(!error.is_unavailable());
+        assert_eq!(error.to_string(), "prettier_error: boom");
     }
 }

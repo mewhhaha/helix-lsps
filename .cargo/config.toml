@@ -1,0 +1,2 @@
+[alias]
+install-lsps = "run -q -p xtask -- install"

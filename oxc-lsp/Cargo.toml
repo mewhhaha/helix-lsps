@@ -1,5 +1,5 @@
 [package]
-name = "tsgo-lsp"
+name = "oxc-lsp"
 version.workspace = true
 edition.workspace = true
 

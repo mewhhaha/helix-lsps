@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "eslint-lsp",
+    "prettier-lsp",
+    "tsgo-lsp",
+    "oxc-lsp",
+    "xtask",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+crossbeam-channel = "0.5"
+lsp-server = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.20"
+tokio = { version = "1.45", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tower-lsp = "0.20"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"

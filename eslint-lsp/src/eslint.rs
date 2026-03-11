@@ -217,6 +217,13 @@ impl Resolver {
     }
 }
 
+pub fn is_tool_unavailable(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("could not resolve a local eslint installation")
+        || message.contains("failed to spawn node while resolving eslint")
+        || message.contains("failed to spawn the eslint worker process")
+}
+
 struct Worker {
     next_request_id: Mutex<u64>,
     process: Mutex<WorkerProcess>,
@@ -413,7 +420,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ConfigFormat, discover_project_roots, format_bridge_error};
+    use anyhow::anyhow;
+
+    use super::{ConfigFormat, discover_project_roots, format_bridge_error, is_tool_unavailable};
 
     #[test]
     fn prefers_nearest_flat_config() {
@@ -486,5 +495,15 @@ mod tests {
 
         assert!(message.contains("not compatible with the local ESLint version"));
         assert!(message.contains("@eslint/compat"));
+    }
+
+    #[test]
+    fn recognizes_missing_eslint_as_unavailable() {
+        assert!(is_tool_unavailable(&anyhow!(
+            "could not resolve a local eslint installation from /tmp/project"
+        )));
+        assert!(is_tool_unavailable(&anyhow!(
+            "failed to spawn the eslint worker process"
+        )));
     }
 }

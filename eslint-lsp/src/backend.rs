@@ -18,7 +18,7 @@ use tracing::warn;
 
 use tokio::{sync::Mutex, time::sleep};
 
-use crate::eslint::{LintMessage, LintRequest, Resolver};
+use crate::eslint::{LintMessage, LintRequest, Resolver, is_tool_unavailable};
 
 const FIX_ALL_ESLINT_KIND: &str = "source.fixAll.eslint";
 const APPLY_FIX_ALL_ESLINT_COMMAND: &str = "eslint.applyFixAll";
@@ -115,6 +115,13 @@ impl Backend {
             }
             Err(error) => {
                 if !self.is_current_generation(&uri, generation).await {
+                    return;
+                }
+
+                if is_tool_unavailable(&error) {
+                    self.client
+                        .publish_diagnostics(uri, Vec::new(), Some(document.version))
+                        .await;
                     return;
                 }
 
@@ -269,6 +276,10 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
 
+        if !self.eslint_available_for_uri(&uri).await {
+            return Ok(None);
+        }
+
         let action = CodeAction {
             title: "Fix all auto-fixable ESLint problems".to_owned(),
             kind: Some(CodeActionKind::new(FIX_ALL_ESLINT_KIND)),
@@ -354,6 +365,20 @@ fn fix_all_command(uri: &Url) -> Command {
         APPLY_FIX_ALL_ESLINT_COMMAND.to_owned(),
         Some(vec![Value::String(uri.to_string())]),
     )
+}
+
+impl Backend {
+    async fn eslint_available_for_uri(&self, uri: &Url) -> bool {
+        let Ok(file_path) = uri.to_file_path() else {
+            return false;
+        };
+
+        self.state
+            .resolver
+            .resolve_project_context(&file_path)
+            .await
+            .is_ok()
+    }
 }
 
 fn synthetic_diagnostic(message: String) -> Diagnostic {
