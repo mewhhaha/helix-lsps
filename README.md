@@ -31,3 +31,44 @@ invocation. For example:
 ```bash
 cargo install-lsps -- --root ~/.local
 ```
+
+## Helix languages.toml
+
+This includes the `tailwindcss-langauge-server` which isn't from this repo.
+
+```toml
+[language-server.oxc]
+command = "oxc-lsp"
+
+[language-server.prettier]
+command = "prettier-lsp"
+
+[language-server.eslint]
+command = "eslint-lsp"
+
+[language-server.tsgo]
+command = "tsgo-lsp"
+
+[language-server.tailwindcss]
+command = "tailwindcss-language-server"
+
+[[language]]
+name = "javascript"
+language-servers = ["oxc", "tailwindcss", "prettier", "eslint", "tsgo"]
+auto-format = true
+
+[[language]]
+name = "typescript"
+language-servers = ["oxc", "tailwindcss", "prettier", "eslint", "tsgo"]
+auto-format = true
+
+[[language]]
+name = "jsx"
+language-servers = ["oxc", "tailwindcss", "prettier", "eslint", "tsgo"]
+auto-format = true
+
+[[language]]
+name = "tsx"
+language-servers = ["oxc", "tailwindcss", "prettier", "eslint", "tsgo"]
+auto-format = true
+```
