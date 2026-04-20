@@ -114,6 +114,10 @@ fn discover_descendant_project(start_dir: &Path) -> Result<Option<ProjectContext
 }
 
 fn should_scan_descendants(start_dir: &Path) -> bool {
+    if is_workspace_root(start_dir) {
+        return true;
+    }
+
     if start_dir.join("pnpm-workspace.yaml").exists() {
         return true;
     }
@@ -129,6 +133,12 @@ fn should_scan_descendants(start_dir: &Path) -> bool {
     package.get("workspaces").is_some()
 }
 
+fn is_workspace_root(start_dir: &Path) -> bool {
+    [".git", ".svn", ".jj", ".helix"]
+        .iter()
+        .any(|marker| start_dir.join(marker).exists())
+}
+
 fn enqueue_child_directories(dir: &Path, queue: &mut VecDeque<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -140,7 +150,7 @@ fn enqueue_child_directories(dir: &Path, queue: &mut VecDeque<PathBuf>) {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .map(|name| !matches!(name, ".git" | "node_modules" | "target"))
+                .map(|name| !matches!(name, "node_modules" | "target") && !name.starts_with('.'))
                 .unwrap_or(true)
         })
         .collect::<Vec<_>>();
@@ -416,6 +426,27 @@ mod tests {
             r#"{"name":"workspace","private":true,"workspaces":["packages/*"]}"#,
         )
         .unwrap();
+        fs::write(package.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        fs::write(package.join("node_modules/.bin/tsgo"), "#!/bin/sh\n").unwrap();
+
+        let discovery = Discovery;
+        let context = discovery.context_for_uri_path(&workspace).unwrap();
+
+        assert_eq!(context.key, SessionKey::Project(package.clone()));
+        assert_eq!(context.root, Some(package));
+    }
+
+    #[test]
+    fn finds_descendant_project_from_git_workspace_root() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let workspace = root.join("workspace");
+        let package = workspace.join("apps/app");
+        let source = package.join("src");
+
+        fs::create_dir_all(workspace.join(".git")).unwrap();
+        fs::create_dir_all(source).unwrap();
+        fs::create_dir_all(package.join("node_modules/.bin")).unwrap();
         fs::write(package.join("package.json"), r#"{"name":"app"}"#).unwrap();
         fs::write(package.join("node_modules/.bin/tsgo"), "#!/bin/sh\n").unwrap();
 

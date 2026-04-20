@@ -222,6 +222,69 @@ fn initializes_from_workspace_root_using_descendant_project_tsgo() -> Result<()>
 }
 
 #[test]
+fn initializes_from_git_root_using_nested_project_tsgo() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path();
+    let fake_tsgo = Path::new(env!("CARGO_BIN_EXE_fake-tsgo"));
+    let nested = root.join("apps");
+
+    fs::create_dir_all(root.join(".git"))?;
+    let project = create_project(&nested, "project-a", fake_tsgo)?;
+
+    let mut harness = Harness::spawn(Path::new(env!("CARGO_BIN_EXE_tsgo-lsp")))?;
+    let root_uri = file_url(root)?;
+    let file = project.join("src/index.ts");
+    let file_uri = file_url(&file)?;
+
+    harness.send(Request::new(
+        RequestId::from(1),
+        "initialize".into(),
+        json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {}
+        }),
+    ))?;
+
+    let initialize = harness.expect_response(RequestId::from(1))?;
+    let server_name = initialize
+        .result
+        .as_ref()
+        .and_then(|result| result.get("serverInfo"))
+        .and_then(|result| result.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(server_name, "fake-tsgo:project-a");
+
+    harness.send(Notification::new("initialized".into(), json!({})))?;
+    harness.send(Notification::new(
+        "textDocument/didOpen".into(),
+        json!({
+            "textDocument": {
+                "uri": file_uri.clone(),
+                "languageId": "typescript",
+                "version": 1,
+                "text": "export const a = 1;\n"
+            }
+        }),
+    ))?;
+
+    let diagnostics = harness.expect_diagnostics(&file_uri)?;
+    assert_eq!(first_diagnostic_message(&diagnostics), "session=project-a");
+
+    harness.send(Request::new(
+        RequestId::from(2),
+        "shutdown".into(),
+        json!(null),
+    ))?;
+    harness.expect_response(RequestId::from(2))?;
+    harness.send(Notification::new("exit".into(), json!(null)))?;
+    harness.wait()?;
+
+    Ok(())
+}
+
+#[test]
 fn returns_error_when_secondary_project_init_fails() -> Result<()> {
     let temp = tempdir()?;
     let root = temp.path();
