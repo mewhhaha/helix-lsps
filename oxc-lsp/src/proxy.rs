@@ -115,6 +115,10 @@ impl Proxy {
             }
         }
 
+        for session in self.sessions.values_mut() {
+            session.terminate();
+        }
+
         Ok(())
     }
 
@@ -128,6 +132,10 @@ impl Proxy {
 
                 if request.method == "shutdown" {
                     self.shutdown_requested = true;
+                    self.connection
+                        .sender
+                        .send(Response::new_ok(request.id, Value::Null).into())?;
+                    return Ok(false);
                 }
 
                 let target = self.resolve_target_for_request(&request)?;

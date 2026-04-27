@@ -1,6 +1,8 @@
 use std::{
     io::{BufReader, BufWriter, Write},
     path::PathBuf,
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow};
@@ -21,6 +23,9 @@ fn run() -> Result<()> {
     }
 
     let label = std::env::var("OXC_FAKE_LABEL").unwrap_or_else(|_| session_label_from_cwd());
+    let shutdown_delay_ms = std::env::var("OXC_FAKE_SHUTDOWN_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
@@ -50,7 +55,11 @@ fn run() -> Result<()> {
                 }
 
                 if request.method == "shutdown" {
-                    Message::Response(Response::new_ok(request.id, json!(null))).write(&mut writer)?;
+                    if let Some(delay_ms) = shutdown_delay_ms {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                    }
+                    Message::Response(Response::new_ok(request.id, json!(null)))
+                        .write(&mut writer)?;
                     writer.flush()?;
                     continue;
                 }

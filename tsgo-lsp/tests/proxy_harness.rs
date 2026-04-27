@@ -8,7 +8,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -119,6 +119,51 @@ fn routes_open_files_to_each_projects_local_tsgo() -> Result<()> {
         json!(null),
     ))?;
     harness.expect_response(RequestId::from(3))?;
+    harness.send(Notification::new("exit".into(), json!(null)))?;
+    harness.wait()?;
+
+    Ok(())
+}
+
+#[test]
+fn responds_to_shutdown_without_waiting_for_child_shutdown() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path();
+    let fake_tsgo = Path::new(env!("CARGO_BIN_EXE_fake-tsgo"));
+    let project = create_project_with_env(
+        root,
+        "project-a",
+        fake_tsgo,
+        &[("TSGO_FAKE_SHUTDOWN_DELAY_MS", "1500")],
+    )?;
+
+    let mut harness = Harness::spawn(Path::new(env!("CARGO_BIN_EXE_tsgo-lsp")))?;
+    let project_uri = file_url(&project)?;
+
+    harness.send(Request::new(
+        RequestId::from(1),
+        "initialize".into(),
+        json!({
+            "processId": std::process::id(),
+            "rootUri": project_uri,
+            "capabilities": {}
+        }),
+    ))?;
+    harness.expect_response(RequestId::from(1))?;
+    harness.send(Notification::new("initialized".into(), json!({})))?;
+
+    let started = Instant::now();
+    harness.send(Request::new(
+        RequestId::from(2),
+        "shutdown".into(),
+        json!(null),
+    ))?;
+    harness.expect_response(RequestId::from(2))?;
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "shutdown response waited for child shutdown"
+    );
+
     harness.send(Notification::new("exit".into(), json!(null)))?;
     harness.wait()?;
 

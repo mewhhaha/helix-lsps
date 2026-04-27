@@ -8,7 +8,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -128,6 +128,53 @@ fn routes_open_files_to_each_projects_local_oxlint() -> Result<()> {
         json!(null),
     ))?;
     harness.expect_response(RequestId::from(3))?;
+    harness.send(Notification::new("exit".into(), json!(null)))?;
+    harness.wait()?;
+
+    Ok(())
+}
+
+#[test]
+fn responds_to_shutdown_without_waiting_for_child_shutdown() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path();
+    let fake_oxlint = Path::new(env!("CARGO_BIN_EXE_fake-oxlint"));
+    let fake_oxfmt = Path::new(env!("CARGO_BIN_EXE_fake-oxfmt"));
+    let project = create_project_with_env(
+        root,
+        "project-a",
+        fake_oxlint,
+        fake_oxfmt,
+        &[("OXC_FAKE_SHUTDOWN_DELAY_MS", "1500")],
+    )?;
+
+    let mut harness = Harness::spawn(Path::new(env!("CARGO_BIN_EXE_oxc-lsp")))?;
+    let project_uri = file_url(&project)?;
+
+    harness.send(Request::new(
+        RequestId::from(1),
+        "initialize".into(),
+        json!({
+            "processId": std::process::id(),
+            "rootUri": project_uri,
+            "capabilities": {}
+        }),
+    ))?;
+    harness.expect_response(RequestId::from(1))?;
+    harness.send(Notification::new("initialized".into(), json!({})))?;
+
+    let started = Instant::now();
+    harness.send(Request::new(
+        RequestId::from(2),
+        "shutdown".into(),
+        json!(null),
+    ))?;
+    harness.expect_response(RequestId::from(2))?;
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "shutdown response waited for child shutdown"
+    );
+
     harness.send(Notification::new("exit".into(), json!(null)))?;
     harness.wait()?;
 
@@ -344,30 +391,60 @@ fn slow_formatter_only_receives_initialized_once() -> Result<()> {
     Ok(())
 }
 
-fn create_project(root: &Path, name: &str, fake_oxlint: &Path, fake_oxfmt: &Path) -> Result<std::path::PathBuf> {
+fn create_project(
+    root: &Path,
+    name: &str,
+    fake_oxlint: &Path,
+    fake_oxfmt: &Path,
+) -> Result<std::path::PathBuf> {
+    create_project_with_env(root, name, fake_oxlint, fake_oxfmt, &[])
+}
+
+fn create_project_with_env(
+    root: &Path,
+    name: &str,
+    fake_oxlint: &Path,
+    fake_oxfmt: &Path,
+    extra_env: &[(&str, &str)],
+) -> Result<std::path::PathBuf> {
     let project = root.join(name);
     let bin_dir = project.join("node_modules/.bin");
     let src_dir = project.join("src");
     fs::create_dir_all(&bin_dir)?;
     fs::create_dir_all(&src_dir)?;
-    fs::write(project.join("package.json"), format!(r#"{{"name":"{name}"}}"#))?;
+    fs::write(
+        project.join("package.json"),
+        format!(r#"{{"name":"{name}"}}"#),
+    )?;
     write_wrapper(
         &bin_dir.join("oxlint"),
         fake_oxlint,
-        &[("OXC_FAKE_LABEL", name)],
+        &wrapper_envs(("OXC_FAKE_LABEL", name), extra_env),
     )?;
     write_wrapper(
         &bin_dir.join("oxfmt"),
         fake_oxfmt,
-        &[("OXC_FAKE_LABEL", name)],
+        &wrapper_envs(("OXC_FAKE_LABEL", name), extra_env),
     )?;
     Ok(project)
+}
+
+fn wrapper_envs<'a>(
+    label: (&'a str, &'a str),
+    extra_env: &'a [(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    let mut envs = vec![label];
+    envs.extend_from_slice(extra_env);
+    envs
 }
 
 fn write_wrapper(path: &Path, target: &Path, envs: &[(&str, &str)]) -> Result<()> {
     let mut script = String::from("#!/bin/sh\n");
     for (key, value) in envs {
-        script.push_str(&format!("export {key}='{}'\n", value.replace('\'', "'\"'\"'")));
+        script.push_str(&format!(
+            "export {key}='{}'\n",
+            value.replace('\'', "'\"'\"'")
+        ));
     }
     script.push_str(&format!("exec '{}' \"$@\"\n", target.display()));
     fs::write(path, script)?;

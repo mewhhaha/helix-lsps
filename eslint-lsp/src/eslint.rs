@@ -322,6 +322,7 @@ async fn spawn_worker_process(key: &ProjectKey) -> Result<WorkerProcess> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .context("failed to spawn the eslint worker process")?;
 

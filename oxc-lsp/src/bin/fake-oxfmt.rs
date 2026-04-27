@@ -27,6 +27,9 @@ fn run() -> Result<()> {
     let init_delay_ms = std::env::var("OXC_FAKE_INIT_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok());
+    let shutdown_delay_ms = std::env::var("OXC_FAKE_SHUTDOWN_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
@@ -58,7 +61,11 @@ fn run() -> Result<()> {
                 }
 
                 if request.method == "shutdown" {
-                    Message::Response(Response::new_ok(request.id, json!(null))).write(&mut writer)?;
+                    if let Some(delay_ms) = shutdown_delay_ms {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                    }
+                    Message::Response(Response::new_ok(request.id, json!(null)))
+                        .write(&mut writer)?;
                     writer.flush()?;
                     continue;
                 }

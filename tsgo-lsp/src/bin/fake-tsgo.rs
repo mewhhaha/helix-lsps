@@ -1,6 +1,8 @@
 use std::{
     io::{BufReader, BufWriter, Write},
     path::PathBuf,
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow};
@@ -24,6 +26,9 @@ fn run() -> Result<()> {
     let init_error = std::env::var("TSGO_FAKE_INIT_ERROR").ok();
     let exit_on_hover = std::env::var_os("TSGO_FAKE_EXIT_ON_HOVER").is_some();
     let empty_hover_response = std::env::var_os("TSGO_FAKE_EMPTY_HOVER_RESPONSE").is_some();
+    let shutdown_delay_ms = std::env::var("TSGO_FAKE_SHUTDOWN_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = BufReader::new(stdin.lock());
@@ -63,6 +68,9 @@ fn run() -> Result<()> {
                 }
 
                 if request.method == "shutdown" {
+                    if let Some(delay_ms) = shutdown_delay_ms {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                    }
                     Message::Response(Response::new_ok(request.id, json!(null)))
                         .write(&mut writer)?;
                     writer.flush()?;
