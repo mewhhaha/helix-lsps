@@ -1,6 +1,6 @@
 use std::{
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, ExitStatus},
 };
 
@@ -71,7 +71,7 @@ fn workspace_root() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("xtask manifest directory has no parent"))
 }
 
-fn ensure_success(status: ExitStatus, package: &str, manifest_path: &PathBuf) -> Result<()> {
+fn ensure_success(status: ExitStatus, package: &str, manifest_path: &Path) -> Result<()> {
     if status.success() {
         return Ok(());
     }

@@ -157,10 +157,7 @@ impl WorkspaceWorker {
             .spawn()
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    FormatError::unavailable(format!(
-                        "failed to spawn {:?}: {error}",
-                        node_binary
-                    ))
+                    FormatError::unavailable(format!("failed to spawn {:?}: {error}", node_binary))
                 } else {
                     FormatError::new(format!("failed to spawn {:?}: {error}", node_binary))
                 }
@@ -242,13 +239,20 @@ impl Formatter for NodePrettierFormatter {
     ) -> Result<FormatOutcome, FormatError> {
         let workspace_dir = resolve_workspace_dir(file_path, workspace_root);
         let worker = self.worker_for(&workspace_dir).await?;
-        let response = worker.request(file_path, source, workspace_root).await;
-
-        let response = match response {
+        let response = match worker.request(file_path, source, workspace_root).await {
             Ok(response) => response,
-            Err(error) => {
+            Err(first_error) => {
                 self.invalidate_worker(&workspace_dir, &worker).await;
-                return Err(error);
+                let worker = self.worker_for(&workspace_dir).await?;
+                match worker.request(file_path, source, workspace_root).await {
+                    Ok(response) => response,
+                    Err(second_error) => {
+                        self.invalidate_worker(&workspace_dir, &worker).await;
+                        return Err(FormatError::new(format!(
+                            "node worker failed after restart: {second_error}; original failure: {first_error}"
+                        )));
+                    }
+                }
             }
         };
 
@@ -295,9 +299,11 @@ fn is_workspace_boundary(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Formatter, NodeBridgeResponse, NodePrettierFormatter, map_response, resolve_workspace_dir};
-    use std::{fs, os::unix::fs::PermissionsExt, path::Path};
-    use tempfile::{tempdir, tempdir_in};
+    use super::{
+        Formatter, NodeBridgeResponse, NodePrettierFormatter, map_response, resolve_workspace_dir,
+    };
+    use std::{fs, os::unix::fs::PermissionsExt};
+    use tempfile::{TempDir, tempdir, tempdir_in};
 
     #[test]
     fn finds_nearest_package_boundary() {
@@ -336,14 +342,9 @@ mod tests {
 
     #[tokio::test]
     async fn reuses_a_single_worker_for_repeated_formats() {
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("harness/workspace");
-        assert!(
-            workspace
-                .join("node_modules/prettier/package.json")
-                .is_file()
-        );
-
-        let scratch_dir = tempdir_in(&workspace).unwrap();
+        let workspace_dir = create_prettier_workspace();
+        let workspace = workspace_dir.path();
+        let scratch_dir = tempdir_in(workspace).unwrap();
         let file_path = scratch_dir.path().join("example.js");
         let wrapper_dir = tempdir().unwrap();
         let counter_path = wrapper_dir.path().join("spawn-count.txt");
@@ -364,16 +365,66 @@ mod tests {
         let source = "const answer={value:\"forty two\"}\n";
 
         formatter
-            .format(&file_path, source, Some(&workspace))
+            .format(&file_path, source, Some(workspace))
             .await
             .unwrap();
         formatter
-            .format(&file_path, source, Some(&workspace))
+            .format(&file_path, source, Some(workspace))
             .await
             .unwrap();
 
         let counter = fs::read_to_string(counter_path).unwrap();
         assert_eq!(counter.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn restarts_worker_after_transport_failure() {
+        let workspace_dir = create_prettier_workspace();
+        let workspace = workspace_dir.path();
+        let scratch_dir = tempdir_in(workspace).unwrap();
+        let file_path = scratch_dir.path().join("example.js");
+        let wrapper_dir = tempdir().unwrap();
+        let counter_path = wrapper_dir.path().join("spawn-count.txt");
+        let wrapper_path = wrapper_dir.path().join("node-wrapper");
+        fs::write(
+            &wrapper_path,
+            format!(
+                "#!/bin/sh\ncount=0\nif [ -f '{0}' ]; then count=$(cat '{0}'); fi\ncount=$((count + 1))\necho \"$count\" > '{0}'\nif [ \"$count\" = \"1\" ]; then exit 0; fi\nexec node \"$@\"\n",
+                counter_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&wrapper_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper_path, permissions).unwrap();
+
+        let formatter = NodePrettierFormatter::new(&wrapper_path);
+        let source = "const answer={value:\"forty two\"}\n";
+        let outcome = formatter
+            .format(&file_path, source, Some(workspace))
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, super::FormatOutcome::Formatted(_)));
+        let counter = fs::read_to_string(counter_path).unwrap();
+        assert_eq!(counter.trim(), "2");
+    }
+
+    fn create_prettier_workspace() -> TempDir {
+        let workspace = tempdir().unwrap();
+        let prettier_dir = workspace.path().join("node_modules/prettier");
+        fs::create_dir_all(&prettier_dir).unwrap();
+        fs::write(
+            prettier_dir.join("package.json"),
+            "{\n  \"name\": \"prettier\",\n  \"version\": \"0.0.0-test\",\n  \"main\": \"index.cjs\"\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            prettier_dir.join("index.cjs"),
+            "module.exports = {\n  getFileInfo: async () => ({ ignored: false, inferredParser: 'babel' }),\n  resolveConfig: async () => null,\n  format: async (source) => `formatted:${source}`,\n};\n",
+        )
+        .unwrap();
+        workspace
     }
 
     #[test]

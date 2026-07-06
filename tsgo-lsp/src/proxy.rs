@@ -29,9 +29,11 @@ pub fn run() -> Result<()> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("tsgo_lsp=info"))
-        .unwrap();
+    let Ok(filter) =
+        EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("tsgo_lsp=info"))
+    else {
+        return;
+    };
 
     let _ = fmt()
         .with_env_filter(filter)
@@ -174,13 +176,14 @@ impl Proxy {
             }
             Message::Response(response) => {
                 if let Some(route) = self.child_request_routes.remove(&response.id) {
-                    if let Some(session) = self.sessions.get(&route.session_key) {
-                        session.send(Message::Response(Response {
-                            id: route.child_request_id,
-                            result: response.result,
-                            error: response.error,
-                        }))?;
-                    }
+                    let Some(session) = self.sessions.get(&route.session_key) else {
+                        return Ok(false);
+                    };
+                    session.send(Message::Response(Response {
+                        id: route.child_request_id,
+                        result: response.result,
+                        error: response.error,
+                    }))?;
                 }
             }
         }
@@ -226,8 +229,11 @@ impl Proxy {
             initialized: None,
         });
 
-        let initial_path = find_initialize_root(&params)
-            .unwrap_or_else(|| std::env::current_dir().expect("cwd should be available"));
+        let initial_path = match find_initialize_root(&params) {
+            Some(path) => path,
+            None => std::env::current_dir()
+                .context("failed to determine current directory for initialize fallback")?,
+        };
         let context = self.discovery.context_for_uri_path(&initial_path)?;
         let key = context.key.clone();
         self.ensure_session(context, false)?;
@@ -345,7 +351,8 @@ impl Proxy {
 
             let target = self.resolve_target_for_uri(&uri)?;
             if notification.method == "textDocument/didOpen" {
-                if let Some(target) = &target {
+                let target = target.as_ref();
+                if let Some(target) = target {
                     self.documents.insert(uri.to_string(), target.clone());
                 }
             }
@@ -469,11 +476,14 @@ impl Proxy {
             return Ok(());
         };
 
-        if let Some(session_key) = self.client_request_routes.get(&cancelled_id) {
-            if let Some(session) = self.sessions.get(session_key) {
-                session.send(notification.clone().into())?;
-            }
-        }
+        let Some(session_key) = self.client_request_routes.get(&cancelled_id) else {
+            return Ok(());
+        };
+        let Some(session) = self.sessions.get(session_key) else {
+            return Ok(());
+        };
+
+        session.send(notification.clone().into())?;
 
         Ok(())
     }
@@ -559,10 +569,9 @@ impl Proxy {
         self.child_request_routes
             .retain(|_, route| &route.session_key != session_key);
 
-        if let Some(mut session) = self.sessions.remove(session_key) {
-            if terminate {
-                session.terminate();
-            }
+        let removed_session = self.sessions.remove(session_key);
+        if let (true, Some(mut session)) = (terminate, removed_session) {
+            session.terminate();
         }
 
         if self.default_session.as_ref() == Some(session_key) {

@@ -56,9 +56,13 @@ impl Session {
             .ok_or_else(|| anyhow!("failed to acquire child stderr"))?;
 
         let (writer, receiver) = crossbeam_channel::unbounded();
-        spawn_writer(context.key.clone(), stdin, receiver);
-        spawn_reader(context.key.clone(), stdout, events.clone());
-        spawn_stderr_logger(context.key.clone(), stderr);
+        if let Err(error) = spawn_writer(context.key.clone(), stdin, receiver)
+            .and_then(|()| spawn_reader(context.key.clone(), stdout, events.clone()))
+            .and_then(|()| spawn_stderr_logger(context.key.clone(), stderr))
+        {
+            terminate_child(&mut child);
+            return Err(error);
+        }
 
         info!(
             key = ?context.key,
@@ -104,11 +108,22 @@ impl Session {
     }
 }
 
+fn terminate_child(child: &mut Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(_) => {}
+    }
+}
+
 fn spawn_writer(
     key: SessionKey,
     stdin: ChildStdin,
     receiver: crossbeam_channel::Receiver<Message>,
-) {
+) -> Result<()> {
     thread::Builder::new()
         .name(format!("tsgo-writer-{key:?}"))
         .spawn(move || {
@@ -120,10 +135,12 @@ fn spawn_writer(
                 }
             }
         })
-        .expect("writer thread should spawn");
+        .context("failed to spawn tsgo writer thread")?;
+
+    Ok(())
 }
 
-fn spawn_reader(key: SessionKey, stdout: ChildStdout, events: Sender<SessionEvent>) {
+fn spawn_reader(key: SessionKey, stdout: ChildStdout, events: Sender<SessionEvent>) -> Result<()> {
     thread::Builder::new()
         .name(format!("tsgo-reader-{key:?}"))
         .spawn(move || {
@@ -149,10 +166,12 @@ fn spawn_reader(key: SessionKey, stdout: ChildStdout, events: Sender<SessionEven
 
             let _ = events.send(SessionEvent::Closed(key));
         })
-        .expect("reader thread should spawn");
+        .context("failed to spawn tsgo reader thread")?;
+
+    Ok(())
 }
 
-fn spawn_stderr_logger(key: SessionKey, stderr: ChildStderr) {
+fn spawn_stderr_logger(key: SessionKey, stderr: ChildStderr) -> Result<()> {
     thread::Builder::new()
         .name(format!("tsgo-stderr-{key:?}"))
         .spawn(move || {
@@ -167,5 +186,7 @@ fn spawn_stderr_logger(key: SessionKey, stderr: ChildStderr) {
                 }
             }
         })
-        .expect("stderr thread should spawn");
+        .context("failed to spawn tsgo stderr thread")?;
+
+    Ok(())
 }

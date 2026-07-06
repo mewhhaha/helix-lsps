@@ -525,10 +525,9 @@ impl Harness {
                 .receiver
                 .recv_timeout(Duration::from_secs(20))
                 .context("timed out waiting for response")?;
-            if let Message::Response(response) = message {
-                if response.id == id {
-                    return Ok(response);
-                }
+            match message {
+                Message::Response(response) if response.id == id => return Ok(response),
+                _ => {}
             }
         }
     }
@@ -539,16 +538,18 @@ impl Harness {
                 .receiver
                 .recv_timeout(Duration::from_secs(20))
                 .context("timed out waiting for diagnostics")?;
-            if let Message::Notification(notification) = message {
-                if notification.method == "textDocument/publishDiagnostics"
-                    && notification
-                        .params
-                        .get("uri")
-                        .and_then(Value::as_str)
-                        .is_some_and(|value| value == uri)
+            match message {
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics"
+                        && notification
+                            .params
+                            .get("uri")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == uri) =>
                 {
                     return Ok(notification);
                 }
+                _ => {}
             }
         }
     }

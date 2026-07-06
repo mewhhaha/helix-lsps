@@ -29,9 +29,11 @@ pub fn run() -> Result<()> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("oxc_lsp=info"))
-        .unwrap();
+    let Ok(filter) =
+        EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("oxc_lsp=info"))
+    else {
+        return;
+    };
 
     let _ = fmt()
         .with_env_filter(filter)
@@ -174,13 +176,14 @@ impl Proxy {
             }
             Message::Response(response) => {
                 if let Some(route) = self.child_request_routes.remove(&response.id) {
-                    if let Some(session) = self.sessions.get(&route.session_id) {
-                        session.send(Message::Response(Response {
-                            id: route.child_request_id,
-                            result: response.result,
-                            error: response.error,
-                        }))?;
-                    }
+                    let Some(session) = self.sessions.get(&route.session_id) else {
+                        return Ok(false);
+                    };
+                    session.send(Message::Response(Response {
+                        id: route.child_request_id,
+                        result: response.result,
+                        error: response.error,
+                    }))?;
                 }
             }
         }
@@ -230,8 +233,11 @@ impl Proxy {
             initialized: None,
         });
 
-        let initial_path = find_initialize_root(&params)
-            .unwrap_or_else(|| std::env::current_dir().expect("cwd should be available"));
+        let initial_path = match find_initialize_root(&params) {
+            Some(path) => path,
+            None => std::env::current_dir()
+                .context("failed to determine current directory for initialize fallback")?,
+        };
         let Some(context) = self.discovery.maybe_context_for_uri_path(&initial_path)? else {
             self.connection
                 .sender
@@ -294,7 +300,8 @@ impl Proxy {
 
         if let Some(route) = self.initialize_routes.remove(&response.id) {
             let initialized = response.error.is_none();
-            let initialize_error_message = response.error.as_ref().map(|error| error.message.clone());
+            let initialize_error_message =
+                response.error.as_ref().map(|error| error.message.clone());
             let has_formatter = self.sessions.contains_key(&SessionId {
                 project: route.session_id.project.clone(),
                 kind: ChildKind::Format,
@@ -363,7 +370,9 @@ impl Proxy {
                 kind: child_kind,
             };
 
-            self.sessions.contains_key(&session_id).then_some(session_id)
+            self.sessions
+                .contains_key(&session_id)
+                .then_some(session_id)
         }))
     }
 
@@ -389,7 +398,8 @@ impl Proxy {
 
             let target = self.resolve_target_for_uri(&uri)?;
             if notification.method == "textDocument/didOpen" {
-                if let Some(project_key) = target.clone() {
+                let project_key = target.clone();
+                if let Some(project_key) = project_key {
                     self.documents
                         .insert(uri.as_str().to_owned(), project_key.clone());
                 }
@@ -397,7 +407,10 @@ impl Proxy {
             return Ok(target.map_or(Dispatch::None, Dispatch::Single));
         }
 
-        Ok(self.default_project.clone().map_or(Dispatch::None, Dispatch::Single))
+        Ok(self
+            .default_project
+            .clone()
+            .map_or(Dispatch::None, Dispatch::Single))
     }
 
     fn resolve_target_for_uri(&mut self, uri: &Url) -> Result<Option<SessionKey>> {
@@ -418,7 +431,11 @@ impl Proxy {
         Ok(Some(project_key))
     }
 
-    fn ensure_project_sessions(&mut self, context: &ProjectContext, send_initialize: bool) -> Result<()> {
+    fn ensure_project_sessions(
+        &mut self,
+        context: &ProjectContext,
+        send_initialize: bool,
+    ) -> Result<()> {
         self.ensure_session(
             SessionId {
                 project: context.key.clone(),
@@ -463,7 +480,12 @@ impl Proxy {
             return Ok(());
         }
 
-        let session = Session::spawn(session_id.clone(), root.clone(), command_spec, self.events_tx.clone())?;
+        let session = Session::spawn(
+            session_id.clone(),
+            root.clone(),
+            command_spec,
+            self.events_tx.clone(),
+        )?;
 
         if send_initialize {
             let initialize_params = self
@@ -579,11 +601,14 @@ impl Proxy {
             return Ok(());
         };
 
-        if let Some(session_id) = self.client_request_routes.get(&cancelled_id) {
-            if let Some(session) = self.sessions.get(session_id) {
-                session.send(notification.clone().into())?;
-            }
-        }
+        let Some(session_id) = self.client_request_routes.get(&cancelled_id) else {
+            return Ok(());
+        };
+        let Some(session) = self.sessions.get(session_id) else {
+            return Ok(());
+        };
+
+        session.send(notification.clone().into())?;
 
         Ok(())
     }
@@ -610,7 +635,12 @@ impl Proxy {
         ))
     }
 
-    fn drop_session(&mut self, session_id: &SessionId, message: &str, terminate: bool) -> Result<()> {
+    fn drop_session(
+        &mut self,
+        session_id: &SessionId,
+        message: &str,
+        terminate: bool,
+    ) -> Result<()> {
         if session_id.kind == ChildKind::Lint {
             self.documents.retain(|_, key| key != &session_id.project);
         }
@@ -666,13 +696,14 @@ impl Proxy {
         self.child_request_routes
             .retain(|_, route| &route.session_id != session_id);
 
-        if let Some(mut session) = self.sessions.remove(session_id) {
-            if terminate {
-                session.terminate();
-            }
+        let removed_session = self.sessions.remove(session_id);
+        if let (true, Some(mut session)) = (terminate, removed_session) {
+            session.terminate();
         }
 
-        if session_id.kind == ChildKind::Lint && self.default_project.as_ref() == Some(&session_id.project) {
+        if session_id.kind == ChildKind::Lint
+            && self.default_project.as_ref() == Some(&session_id.project)
+        {
             self.default_project = None;
         }
 
@@ -681,7 +712,9 @@ impl Proxy {
     }
 
     fn root_for_session(&self, session_id: &SessionId) -> Option<&Path> {
-        self.sessions.get(session_id).and_then(|session| session.root.as_deref())
+        self.sessions
+            .get(session_id)
+            .and_then(|session| session.root.as_deref())
     }
 }
 
@@ -779,11 +812,10 @@ fn normalize_initialize_response_for_client(
         return response;
     };
 
-    let capabilities = object
-        .entry("capabilities")
-        .or_insert_with(|| json!({}));
+    let capabilities = object.entry("capabilities").or_insert_with(|| json!({}));
     if has_formatter {
-        if let Some(capabilities) = capabilities.as_object_mut() {
+        let capabilities = capabilities.as_object_mut();
+        if let Some(capabilities) = capabilities {
             capabilities
                 .entry("documentFormattingProvider")
                 .or_insert_with(|| Value::Bool(true));
@@ -833,7 +865,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        normalize_child_response, normalize_initialize_response_for_client, silent_initialize_result,
+        normalize_child_response, normalize_initialize_response_for_client,
+        silent_initialize_result,
     };
 
     #[test]

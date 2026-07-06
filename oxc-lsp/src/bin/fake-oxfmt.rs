@@ -106,7 +106,8 @@ fn run() -> Result<()> {
                 }
 
                 if notification.method == "initialized" {
-                    if let Some(state_path) = &initialized_state {
+                    let state_path = initialized_state.as_ref();
+                    if let Some(state_path) = state_path {
                         let count = std::fs::read_to_string(state_path)
                             .ok()
                             .and_then(|value| value.trim().parse::<u64>().ok())

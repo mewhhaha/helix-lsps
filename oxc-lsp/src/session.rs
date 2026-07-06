@@ -74,9 +74,13 @@ impl Session {
             .ok_or_else(|| anyhow!("failed to acquire child stderr"))?;
 
         let (writer, receiver) = crossbeam_channel::unbounded();
-        spawn_writer(id.clone(), stdin, receiver);
-        spawn_reader(id.clone(), stdout, events.clone());
-        spawn_stderr_logger(id.clone(), stderr);
+        if let Err(error) = spawn_writer(id.clone(), stdin, receiver)
+            .and_then(|()| spawn_reader(id.clone(), stdout, events.clone()))
+            .and_then(|()| spawn_stderr_logger(id.clone(), stderr))
+        {
+            terminate_child(&mut child);
+            return Err(error);
+        }
 
         info!(
             id = ?id,
@@ -122,11 +126,22 @@ impl Session {
     }
 }
 
+fn terminate_child(child: &mut Child) {
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Err(_) => {}
+    }
+}
+
 fn spawn_writer(
     id: SessionId,
     stdin: ChildStdin,
     receiver: crossbeam_channel::Receiver<Message>,
-) {
+) -> Result<()> {
     thread::Builder::new()
         .name(format!("oxc-writer-{id:?}"))
         .spawn(move || {
@@ -138,10 +153,12 @@ fn spawn_writer(
                 }
             }
         })
-        .expect("writer thread should spawn");
+        .context("failed to spawn oxc writer thread")?;
+
+    Ok(())
 }
 
-fn spawn_reader(id: SessionId, stdout: ChildStdout, events: Sender<SessionEvent>) {
+fn spawn_reader(id: SessionId, stdout: ChildStdout, events: Sender<SessionEvent>) -> Result<()> {
     thread::Builder::new()
         .name(format!("oxc-reader-{id:?}"))
         .spawn(move || {
@@ -150,7 +167,10 @@ fn spawn_reader(id: SessionId, stdout: ChildStdout, events: Sender<SessionEvent>
             loop {
                 match Message::read(&mut stdout) {
                     Ok(Some(message)) => {
-                        if events.send(SessionEvent::Message(id.clone(), message)).is_err() {
+                        if events
+                            .send(SessionEvent::Message(id.clone(), message))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -164,10 +184,12 @@ fn spawn_reader(id: SessionId, stdout: ChildStdout, events: Sender<SessionEvent>
 
             let _ = events.send(SessionEvent::Closed(id));
         })
-        .expect("reader thread should spawn");
+        .context("failed to spawn oxc reader thread")?;
+
+    Ok(())
 }
 
-fn spawn_stderr_logger(id: SessionId, stderr: ChildStderr) {
+fn spawn_stderr_logger(id: SessionId, stderr: ChildStderr) -> Result<()> {
     thread::Builder::new()
         .name(format!("oxc-stderr-{id:?}"))
         .spawn(move || {
@@ -182,5 +204,7 @@ fn spawn_stderr_logger(id: SessionId, stderr: ChildStderr) {
                 }
             }
         })
-        .expect("stderr thread should spawn");
+        .context("failed to spawn oxc stderr thread")?;
+
+    Ok(())
 }

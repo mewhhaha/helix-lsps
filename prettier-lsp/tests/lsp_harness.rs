@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 
@@ -11,13 +11,10 @@ use tower_lsp::lsp_types::Url;
 
 #[test]
 fn formats_with_workspace_prettier() {
-    let workspace_dir = harness_workspace_dir();
-    assert!(
-        workspace_dir
-            .join("node_modules/prettier/package.json")
-            .is_file(),
-        "install harness dependencies first with `cd harness/workspace && npm install`"
-    );
+    let fixture = tempdir().unwrap();
+    let workspace_dir = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).unwrap();
+    install_fake_prettier(&workspace_dir, "workspace prettier\n");
 
     let scratch_dir = tempdir_in(&workspace_dir).unwrap();
     let file_path = scratch_dir.path().join("example.js");
@@ -37,7 +34,7 @@ fn formats_with_workspace_prettier() {
                 "start": { "line": 0, "character": 0 },
                 "end": { "line": 1, "character": 0 }
             },
-            "newText": "const answer = { value: \"forty two\" };\n"
+            "newText": "workspace prettier\n"
         }])
     );
 
@@ -140,7 +137,7 @@ fn picks_up_workspace_folder_changes_after_initialize() {
     change_workspace_folders(&mut harness, vec![&workspace_b], Vec::new());
 
     let formatting = format_document(&mut harness, &file_path);
-    assert_eq!(formatting["error"]["code"], json!(-32603));
+    assert_eq!(formatting["result"], json!([]));
 
     harness.shutdown();
 }
@@ -168,13 +165,9 @@ fn does_not_escape_initialized_workspace_when_resolving_prettier() {
     open_document(&mut harness, &file_path, input);
 
     let formatting = format_document(&mut harness, &file_path);
-    assert_eq!(formatting["error"]["code"], json!(-32603));
+    assert_eq!(formatting["result"], json!([]));
 
     harness.shutdown();
-}
-
-fn harness_workspace_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("harness/workspace")
 }
 
 fn install_fake_prettier(dir: &Path, formatted: &str) {

@@ -34,7 +34,7 @@ cargo install-lsps -- --root ~/.local
 
 ## Helix languages.toml
 
-This includes the `tailwindcss-langauge-server` which isn't from this repo.
+These are the configurations you can add to your `<config_dir>/helix/languages.toml`. This includes the `tailwindcss-language-server` which isn't from this repo.
 
 ```toml
 [language-server.oxc]

@@ -225,6 +225,7 @@ pub fn is_tool_unavailable(error: &anyhow::Error) -> bool {
 }
 
 struct Worker {
+    key: ProjectKey,
     next_request_id: Mutex<u64>,
     process: Mutex<WorkerProcess>,
 }
@@ -237,13 +238,45 @@ struct WorkerProcess {
 
 impl Worker {
     async fn spawn(key: ProjectKey) -> Result<Self> {
+        let process = spawn_worker_process(&key)?;
+
         Ok(Self {
+            key,
             next_request_id: Mutex::new(0),
-            process: Mutex::new(spawn_worker_process(&key).await?),
+            process: Mutex::new(process),
         })
     }
 
     async fn lint(&self, request: &LintRequest) -> Result<LintResponse> {
+        let mut process = self.process.lock().await;
+
+        match self.lint_with_process(request, &mut process).await {
+            Ok(response) => Ok(response),
+            Err(error) if should_restart_worker_after(&error) => {
+                let _ = process.child.start_kill();
+                let _ = process.child.wait().await;
+                let replacement = spawn_worker_process(&self.key).with_context(|| {
+                    format!("failed to restart eslint worker after request failure: {error}")
+                })?;
+                *process = replacement;
+
+                self.lint_with_process(request, &mut process)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "eslint worker request failed after restart; original failure: {error}"
+                        )
+                    })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn lint_with_process(
+        &self,
+        request: &LintRequest,
+        process: &mut WorkerProcess,
+    ) -> Result<LintResponse> {
         let request_id = {
             let mut next = self.next_request_id.lock().await;
             *next += 1;
@@ -258,31 +291,28 @@ impl Worker {
         })?;
 
         let mut line = String::new();
-        {
-            let mut process = self.process.lock().await;
-            process
-                .stdin
-                .write_all(payload.as_bytes())
-                .await
-                .context("failed to write request to eslint worker")?;
-            process
-                .stdin
-                .write_all(b"\n")
-                .await
-                .context("failed to flush request delimiter to eslint worker")?;
-            process
-                .stdout
-                .read_line(&mut line)
-                .await
-                .context("failed to read response from eslint worker")?;
+        process
+            .stdin
+            .write_all(payload.as_bytes())
+            .await
+            .context("failed to write request to eslint worker")?;
+        process
+            .stdin
+            .write_all(b"\n")
+            .await
+            .context("failed to flush request delimiter to eslint worker")?;
+        process
+            .stdout
+            .read_line(&mut line)
+            .await
+            .context("failed to read response from eslint worker")?;
 
-            if line.is_empty() {
-                return Err(anyhow!("eslint worker exited before replying"));
-            }
+        if line.is_empty() {
+            return Err(anyhow!("eslint worker exited before replying"));
+        }
 
-            if process.child.try_wait()?.is_some() {
-                return Err(anyhow!("eslint worker exited unexpectedly"));
-            }
+        if process.child.try_wait()?.is_some() {
+            return Err(anyhow!("eslint worker exited unexpectedly"));
         }
 
         let envelope: BridgeEnvelope =
@@ -309,7 +339,7 @@ impl Worker {
     }
 }
 
-async fn spawn_worker_process(key: &ProjectKey) -> Result<WorkerProcess> {
+fn spawn_worker_process(key: &ProjectKey) -> Result<WorkerProcess> {
     let bridge_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("node")
         .join("eslint-bridge.mjs");
@@ -357,6 +387,18 @@ fn format_bridge_error(stderr: &str) -> String {
     }
 
     format!("ESLint failed while evaluating the local project setup: {summary}")
+}
+
+fn should_restart_worker_after(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+
+    message.contains("failed to write request to eslint worker")
+        || message.contains("failed to flush request delimiter to eslint worker")
+        || message.contains("failed to read response from eslint worker")
+        || message.contains("eslint worker exited before replying")
+        || message.contains("eslint worker exited unexpectedly")
+        || message.contains("failed to decode eslint worker response")
+        || message.contains("eslint worker response id mismatch")
 }
 
 fn discover_project_roots(start_dir: &Path) -> Result<ProjectRoots> {
@@ -417,13 +459,31 @@ fn package_json_has_eslint_config(dir: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    use std::{env, fs};
 
     use tempfile::tempdir;
 
     use anyhow::anyhow;
 
-    use super::{ConfigFormat, discover_project_roots, format_bridge_error, is_tool_unavailable};
+    use super::{
+        ConfigFormat, LintRequest, ProjectKey, Worker, discover_project_roots, format_bridge_error,
+        is_tool_unavailable, should_restart_worker_after,
+    };
+
+    #[cfg(unix)]
+    struct PathRestore(Option<OsString>);
+
+    #[cfg(unix)]
+    impl Drop for PathRestore {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(path) => unsafe { env::set_var("PATH", path) },
+                None => unsafe { env::remove_var("PATH") },
+            }
+        }
+    }
 
     #[test]
     fn prefers_nearest_flat_config() {
@@ -478,7 +538,11 @@ mod tests {
         let package = root.join("packages/app");
         let nested = package.join("src");
         fs::create_dir_all(&nested).unwrap();
-        fs::write(root.join("package.json"), r#"{"name":"workspace","private":true,"workspaces":["packages/*"]}"#).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"workspace","private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
         fs::write(root.join("eslint.config.mjs"), "export default [];").unwrap();
         fs::write(package.join("package.json"), r#"{"name":"app"}"#).unwrap();
 
@@ -506,5 +570,74 @@ mod tests {
         assert!(is_tool_unavailable(&anyhow!(
             "failed to spawn the eslint worker process"
         )));
+    }
+
+    #[test]
+    fn restarts_worker_after_transport_failures_only() {
+        assert!(should_restart_worker_after(&anyhow!(
+            "eslint worker exited before replying"
+        )));
+        assert!(should_restart_worker_after(&anyhow!(
+            "failed to decode eslint worker response"
+        )));
+        assert!(!should_restart_worker_after(&anyhow!(
+            "ESLint failed while evaluating the local project setup"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restarts_worker_after_the_child_exits_before_replying() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        let bin_dir = temp.path().join("bin");
+        let counter_path = temp.path().join("spawn-count.txt");
+        let node_path = bin_dir.join("node");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(
+            &node_path,
+            format!(
+                "#!/bin/sh\ncount=0\nif [ -f '{0}' ]; then count=$(cat '{0}'); fi\ncount=$((count + 1))\necho \"$count\" > '{0}'\nif [ \"$count\" = \"1\" ]; then exit 0; fi\nwhile IFS= read -r line; do\n  printf '%s\\n' '{{\"id\":2,\"ok\":true,\"diagnostics\":[],\"fixedText\":\"fixed text\"}}'\ndone\n",
+                counter_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&node_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&node_path, permissions).unwrap();
+
+        let old_path = env::var_os("PATH");
+        let _path_restore = PathRestore(old_path.clone());
+        let mut paths = vec![bin_dir.clone()];
+        if let Some(old_path) = &old_path {
+            paths.extend(env::split_paths(old_path));
+        }
+        let new_path = env::join_paths(paths).unwrap();
+        unsafe {
+            env::set_var("PATH", new_path);
+        }
+
+        let worker = Worker::spawn(ProjectKey {
+            cwd: project.clone(),
+            config_format: ConfigFormat::Default,
+            eslint_package_json: project.join("node_modules/eslint/package.json"),
+        })
+        .await
+        .unwrap();
+        let response = worker
+            .lint(&LintRequest {
+                file_path: project.join("src/index.js"),
+                text: "const value = 1;\n".into(),
+                fix: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.fixed_text.as_deref(), Some("fixed text"));
+        let counter = fs::read_to_string(counter_path).unwrap();
+        assert_eq!(counter.trim(), "2");
     }
 }

@@ -72,10 +72,13 @@ impl Discovery {
 
     #[cfg(test)]
     pub fn context_for_uri_path(&self, file_path: &Path) -> Result<ProjectContext> {
-        self.maybe_context_for_uri_path(file_path)?
-            .ok_or_else(|| anyhow!("no oxlint installation is available for {}", file_path.display()))
+        self.maybe_context_for_uri_path(file_path)?.ok_or_else(|| {
+            anyhow!(
+                "no oxlint installation is available for {}",
+                file_path.display()
+            )
+        })
     }
-
 }
 
 fn discover_local_project(file_path: &Path) -> Result<Option<ProjectContext>> {
@@ -110,7 +113,8 @@ fn discover_local_project(file_path: &Path) -> Result<Option<ProjectContext>> {
     }
 
     if file_path.is_dir() {
-        if let Some(project) = discover_descendant_project(start_dir)? {
+        let project = discover_descendant_project(start_dir)?;
+        if let Some(project) = project {
             return Ok(Some(project));
         }
     }
@@ -126,7 +130,8 @@ fn discover_descendant_project(start_dir: &Path) -> Result<Option<ProjectContext
     let mut queue = VecDeque::from([start_dir.to_path_buf()]);
     while let Some(candidate) = queue.pop_front() {
         if candidate.join("package.json").is_file() {
-            if let Some(lint_command) = resolve_local_command(&candidate, &OXLINT)? {
+            let lint_command = resolve_local_command(&candidate, &OXLINT)?;
+            if let Some(lint_command) = lint_command {
                 return Ok(Some(ProjectContext {
                     key: SessionKey::Project(candidate.clone()),
                     root: Some(candidate.clone()),
@@ -242,10 +247,10 @@ fn package_command_from_package_json(
             )
         })?;
 
-    let binary = package_json
+    let package_dir = package_json
         .parent()
-        .expect("package.json always has a parent")
-        .join(relative_bin);
+        .ok_or_else(|| anyhow!("package path has no parent: {}", package_json.display()))?;
+    let binary = package_dir.join(relative_bin);
 
     Ok(Some(if is_node_entrypoint(&binary) {
         CommandSpec {
