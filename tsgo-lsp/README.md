@@ -13,6 +13,8 @@ from `@typescript/native-preview`.
   `PATH`.
 - Requests and notifications for open files are routed to the matching child
   session by file URI.
+- Project roots are polled for TypeScript, JavaScript, and JSON file changes so
+  external file creation is forwarded to `tsgo` as `workspace/didChangeWatchedFiles`.
 - If a child exits or fails initialization, the wrapper returns LSP errors
   instead of leaving requests hanging.
 

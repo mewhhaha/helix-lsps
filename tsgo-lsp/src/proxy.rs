@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -12,14 +13,17 @@ use url::Url;
 
 use crate::{
     discovery::{Discovery, ProjectContext, SessionKey},
+    file_watcher::{WatchedFileChange, WorkspaceWatcher},
     session::{Session, SessionEvent},
 };
+
+const FILE_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn run() -> Result<()> {
     init_tracing();
 
     let (connection, io_threads) = Connection::stdio();
-    match Proxy::new(connection).run() {
+    match Proxy::new(connection)?.run() {
         Ok(()) => {
             io_threads.join().context("failed to join stdio threads")?;
             Ok(())
@@ -55,6 +59,8 @@ struct Proxy {
     internal_request_counter: usize,
     events_tx: Sender<SessionEvent>,
     events_rx: Receiver<SessionEvent>,
+    watch_rx: Receiver<Vec<WatchedFileChange>>,
+    workspace_watcher: WorkspaceWatcher,
     shutdown_requested: bool,
 }
 
@@ -75,10 +81,11 @@ struct InitializeRoute {
 }
 
 impl Proxy {
-    fn new(connection: Connection) -> Self {
+    fn new(connection: Connection) -> Result<Self> {
         let (events_tx, events_rx) = unbounded();
+        let (workspace_watcher, watch_rx) = WorkspaceWatcher::spawn(FILE_WATCH_INTERVAL)?;
 
-        Self {
+        Ok(Self {
             connection,
             discovery: Discovery,
             sessions: HashMap::new(),
@@ -91,8 +98,10 @@ impl Proxy {
             internal_request_counter: 0,
             events_tx,
             events_rx,
+            watch_rx,
+            workspace_watcher,
             shutdown_requested: false,
-        }
+        })
     }
 
     fn run(mut self) -> Result<()> {
@@ -113,6 +122,13 @@ impl Proxy {
                     };
 
                     self.handle_session_event(event)?;
+                }
+                recv(self.watch_rx) -> changes => {
+                    let Ok(changes) = changes else {
+                        break;
+                    };
+
+                    self.handle_watched_file_changes(changes)?;
                 }
             }
         }
@@ -154,6 +170,7 @@ impl Proxy {
                 if notification.method == "initialized" {
                     self.store_initialized(notification.clone());
                     self.broadcast_or_dispatch_initialized(notification)?;
+                    self.workspace_watcher.set_active(true);
                     return Ok(false);
                 }
 
@@ -189,6 +206,47 @@ impl Proxy {
         }
 
         Ok(false)
+    }
+
+    fn handle_watched_file_changes(&mut self, changes: Vec<WatchedFileChange>) -> Result<()> {
+        let mut changes_by_session = HashMap::<SessionKey, Vec<Value>>::new();
+        for change in changes {
+            if self.documents.contains_key(&change.uri) {
+                continue;
+            }
+
+            changes_by_session
+                .entry(change.session_key)
+                .or_default()
+                .push(json!({
+                    "uri": change.uri,
+                    "type": change.kind.lsp_file_change_type(),
+                }));
+        }
+
+        for (session_key, changes) in changes_by_session {
+            if !self.sessions.contains_key(&session_key) {
+                continue;
+            }
+
+            self.dispatch_watched_file_changes(session_key, changes)?;
+        }
+
+        Ok(())
+    }
+
+    fn dispatch_watched_file_changes(
+        &mut self,
+        session_key: SessionKey,
+        changes: Vec<Value>,
+    ) -> Result<()> {
+        let notification = Notification::new(
+            "workspace/didChangeWatchedFiles".into(),
+            json!({
+                "changes": changes
+            }),
+        );
+        self.dispatch_to_session(session_key, notification.into())
     }
 
     fn handle_session_event(&mut self, event: SessionEvent) -> Result<()> {
@@ -387,6 +445,7 @@ impl Proxy {
 
         let key = context.key.clone();
         let session_root = context.root.clone();
+        let watch_root = watch_root_for_context(&context);
         let session = Session::spawn(context, self.events_tx.clone())?;
 
         if send_initialize {
@@ -409,6 +468,9 @@ impl Proxy {
             }
         }
 
+        if let Some(root) = watch_root {
+            self.workspace_watcher.watch(key.clone(), root);
+        }
         self.sessions.insert(key, session);
         Ok(())
     }
@@ -517,6 +579,7 @@ impl Proxy {
         terminate: bool,
     ) -> Result<()> {
         self.documents.retain(|_, key| key != session_key);
+        self.workspace_watcher.unwatch(session_key);
 
         let response_ids = self
             .client_request_routes
@@ -650,6 +713,14 @@ fn rewrite_initialize_params(params: &Value, root: Option<&Path>) -> Result<Valu
     );
 
     Ok(params)
+}
+
+fn watch_root_for_context(context: &ProjectContext) -> Option<PathBuf> {
+    if let Some(root) = context.root.clone() {
+        return Some(root);
+    }
+
+    context.command.cwd.clone()
 }
 
 fn find_uri(params: &Value) -> Option<Url> {

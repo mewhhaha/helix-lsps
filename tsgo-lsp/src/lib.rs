@@ -1,4 +1,5 @@
 mod discovery;
+mod file_watcher;
 mod proxy;
 mod session;
 

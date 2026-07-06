@@ -171,6 +171,95 @@ fn responds_to_shutdown_without_waiting_for_child_shutdown() -> Result<()> {
 }
 
 #[test]
+fn sends_watched_file_create_for_external_typescript_file() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path();
+    let fake_tsgo = Path::new(env!("CARGO_BIN_EXE_fake-tsgo"));
+    let project = create_project(root, "project-a", fake_tsgo)?;
+
+    let mut harness = Harness::spawn(Path::new(env!("CARGO_BIN_EXE_tsgo-lsp")))?;
+    let project_uri = file_url(&project)?;
+
+    harness.send(Request::new(
+        RequestId::from(1),
+        "initialize".into(),
+        json!({
+            "processId": std::process::id(),
+            "rootUri": project_uri,
+            "capabilities": {}
+        }),
+    ))?;
+    harness.expect_response(RequestId::from(1))?;
+    harness.send(Notification::new("initialized".into(), json!({})))?;
+
+    let created_file = project.join("src/created.ts");
+    let created_file_uri = file_url(&created_file)?;
+    fs::write(&created_file, "export const created = true;\n")?;
+
+    let diagnostics = harness.expect_diagnostics(&created_file_uri)?;
+    assert_eq!(
+        first_diagnostic_message(&diagnostics),
+        "session=project-a;watched=created"
+    );
+
+    harness.send(Request::new(
+        RequestId::from(2),
+        "shutdown".into(),
+        json!(null),
+    ))?;
+    harness.expect_response(RequestId::from(2))?;
+    harness.send(Notification::new("exit".into(), json!(null)))?;
+    harness.wait()?;
+
+    Ok(())
+}
+
+#[test]
+fn delays_watched_file_create_until_client_initialized() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path();
+    let fake_tsgo = Path::new(env!("CARGO_BIN_EXE_fake-tsgo"));
+    let project = create_project(root, "project-a", fake_tsgo)?;
+
+    let mut harness = Harness::spawn(Path::new(env!("CARGO_BIN_EXE_tsgo-lsp")))?;
+    let project_uri = file_url(&project)?;
+
+    harness.send(Request::new(
+        RequestId::from(1),
+        "initialize".into(),
+        json!({
+            "processId": std::process::id(),
+            "rootUri": project_uri,
+            "capabilities": {}
+        }),
+    ))?;
+    harness.expect_response(RequestId::from(1))?;
+
+    let created_file = project.join("src/created-before-initialized.ts");
+    let created_file_uri = file_url(&created_file)?;
+    fs::write(&created_file, "export const created = true;\n")?;
+    harness.expect_no_message(Duration::from_millis(1500))?;
+
+    harness.send(Notification::new("initialized".into(), json!({})))?;
+    let diagnostics = harness.expect_diagnostics(&created_file_uri)?;
+    assert_eq!(
+        first_diagnostic_message(&diagnostics),
+        "session=project-a;watched=created"
+    );
+
+    harness.send(Request::new(
+        RequestId::from(2),
+        "shutdown".into(),
+        json!(null),
+    ))?;
+    harness.expect_response(RequestId::from(2))?;
+    harness.send(Notification::new("exit".into(), json!(null)))?;
+    harness.wait()?;
+
+    Ok(())
+}
+
+#[test]
 fn returns_initialize_error_when_no_tsgo_is_available() -> Result<()> {
     let temp = tempdir()?;
     let root = temp.path();
@@ -567,6 +656,14 @@ impl Harness {
             }
             _ => None,
         })
+    }
+
+    fn expect_no_message(&self, timeout: Duration) -> Result<()> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(message) => Err(anyhow!("unexpected LSP message: {message:?}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+            Err(error) => Err(error).context("failed while waiting for no LSP messages"),
+        }
     }
 
     fn recv_matching<T>(&self, mut matcher: impl FnMut(Message) -> Option<T>) -> Result<T> {

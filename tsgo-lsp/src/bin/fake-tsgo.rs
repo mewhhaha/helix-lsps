@@ -144,6 +144,51 @@ fn run() -> Result<()> {
                     Message::Notification(publish).write(&mut writer)?;
                     writer.flush()?;
                 }
+
+                if notification.method == "workspace/didChangeWatchedFiles" {
+                    let changes = notification
+                        .params
+                        .get("changes")
+                        .and_then(|value| value.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    for change in changes {
+                        let uri = change
+                            .get("uri")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default();
+                        let change_type = change
+                            .get("type")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or_default();
+                        let change_label = match change_type {
+                            1 => "created",
+                            2 => "changed",
+                            3 => "deleted",
+                            _ => "unknown",
+                        };
+                        let publish = Notification::new(
+                            "textDocument/publishDiagnostics".into(),
+                            json!({
+                                "uri": uri,
+                                "diagnostics": [
+                                    {
+                                        "range": {
+                                            "start": {"line": 0, "character": 0},
+                                            "end": {"line": 0, "character": 1}
+                                        },
+                                        "severity": 2,
+                                        "source": "fake-tsgo",
+                                        "message": format!("session={label};watched={change_label}"),
+                                    }
+                                ]
+                            }),
+                        );
+                        Message::Notification(publish).write(&mut writer)?;
+                        writer.flush()?;
+                    }
+                }
             }
             Message::Response(_) => {}
         }
