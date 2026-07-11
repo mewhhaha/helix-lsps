@@ -25,6 +25,22 @@ That command installs only the real LSP binaries:
 
 The installer uses the workspace `Cargo.lock` by default.
 
+## tsgo-lsp and TypeScript versions
+
+`tsgo-lsp` looks for a TypeScript language server in this order, walking up
+from the opened file:
+
+1. `node_modules/.bin/tsgo` (an installed `@typescript/native-preview`)
+2. the `@typescript/native-preview` package
+3. the `typescript` package, if its major version is 7 or newer (TypeScript 7
+   is the native compiler; its `tsc` speaks `--lsp --stdio`)
+4. a global `tsgo` on `PATH`
+
+For packages resolved via 2 or 3 it prefers launching the native platform
+binary (e.g. `@typescript/typescript-linux-x64/lib/tsc`) directly over the
+Node bin shim, so the child process is owned by the wrapper. TypeScript 6 and
+older have no LSP mode and are ignored.
+
 Extra arguments after `--` are forwarded to each underlying `cargo install`
 invocation. For example:
 
