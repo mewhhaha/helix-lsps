@@ -478,6 +478,76 @@ fn returns_error_when_secondary_project_init_fails() -> Result<()> {
 }
 
 #[test]
+fn survives_project_whose_tsgo_cannot_spawn() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path();
+    let fake_tsgo = Path::new(env!("CARGO_BIN_EXE_fake-tsgo"));
+
+    let project_a = create_project(root, "project-a", fake_tsgo)?;
+    let project_b = create_project(root, "project-b", fake_tsgo)?;
+    // A shim without the executable bit makes Session::spawn fail.
+    let broken_shim = project_b.join("node_modules/.bin/tsgo");
+    let mut permissions = fs::metadata(&broken_shim)?.permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&broken_shim, permissions)?;
+
+    let mut harness = Harness::spawn(Path::new(env!("CARGO_BIN_EXE_tsgo-lsp")))?;
+    let project_a_uri = file_url(&project_a)?;
+    let file_a = project_a.join("src/index.ts");
+    let file_b = project_b.join("src/index.ts");
+    let file_a_uri = file_url(&file_a)?;
+    let file_b_uri = file_url(&file_b)?;
+
+    harness.send(Request::new(
+        RequestId::from(1),
+        "initialize".into(),
+        json!({
+            "processId": std::process::id(),
+            "rootUri": project_a_uri,
+            "capabilities": {}
+        }),
+    ))?;
+    harness.expect_response(RequestId::from(1))?;
+    harness.send(Notification::new("initialized".into(), json!({})))?;
+
+    harness.send(Request::new(
+        RequestId::from(2),
+        "textDocument/hover".into(),
+        json!({
+            "textDocument": {"uri": file_b_uri},
+            "position": {"line": 0, "character": 0}
+        }),
+    ))?;
+    let response = harness.expect_response(RequestId::from(2))?;
+    assert!(response.error.is_some(), "hover into broken project fails");
+
+    harness.send(Notification::new(
+        "textDocument/didOpen".into(),
+        json!({
+            "textDocument": {
+                "uri": file_a_uri,
+                "languageId": "typescript",
+                "version": 1,
+                "text": "export const a = 1;\n"
+            }
+        }),
+    ))?;
+    let diagnostics = harness.expect_diagnostics(&file_a_uri)?;
+    assert_eq!(first_diagnostic_message(&diagnostics), "session=project-a");
+
+    harness.send(Request::new(
+        RequestId::from(3),
+        "shutdown".into(),
+        json!(null),
+    ))?;
+    harness.expect_response(RequestId::from(3))?;
+    harness.send(Notification::new("exit".into(), json!(null)))?;
+    harness.wait()?;
+
+    Ok(())
+}
+
+#[test]
 fn returns_error_when_child_exits_during_request() -> Result<()> {
     let temp = tempdir()?;
     let root = temp.path();

@@ -143,6 +143,18 @@ impl Proxy {
     fn handle_client_message(&mut self, message: Message) -> Result<bool> {
         match message {
             Message::Request(request) => {
+                if self.shutdown_requested {
+                    self.connection.sender.send(
+                        Response::new_err(
+                            request.id,
+                            ErrorCode::InvalidRequest as i32,
+                            format!("received {} after shutdown", request.method),
+                        )
+                        .into(),
+                    )?;
+                    return Ok(false);
+                }
+
                 if request.method == "initialize" {
                     self.handle_initialize(request)?;
                     return Ok(false);
@@ -175,7 +187,7 @@ impl Proxy {
                 }
 
                 if notification.method == "exit" {
-                    self.broadcast_notification(notification);
+                    self.broadcast_notification(notification)?;
                     return Ok(true);
                 }
 
@@ -187,7 +199,7 @@ impl Proxy {
                     Dispatch::Single(target) => {
                         self.dispatch_to_session(target, notification.into())?
                     }
-                    Dispatch::Broadcast => self.broadcast_notification(notification),
+                    Dispatch::Broadcast => self.broadcast_notification(notification)?,
                     Dispatch::None => {}
                 }
             }
@@ -251,19 +263,37 @@ impl Proxy {
 
     fn handle_session_event(&mut self, event: SessionEvent) -> Result<()> {
         match event {
-            SessionEvent::Message(session_key, message) => match message {
-                Message::Request(request) => self.handle_child_request(session_key, request)?,
-                Message::Response(response) => self.handle_child_response(session_key, response)?,
-                Message::Notification(notification) => {
-                    self.connection.sender.send(notification.into())?;
+            SessionEvent::Message(session_key, generation, message) => {
+                if !self.is_current_session(&session_key, generation) {
+                    return Ok(());
                 }
-            },
-            SessionEvent::Closed(session_key) => {
-                self.drop_session(&session_key, "tsgo child exited unexpectedly", false)?;
+
+                match message {
+                    Message::Request(request) => self.handle_child_request(session_key, request)?,
+                    Message::Response(response) => {
+                        self.handle_child_response(session_key, response)?
+                    }
+                    Message::Notification(notification) => {
+                        self.connection.sender.send(notification.into())?;
+                    }
+                }
+            }
+            SessionEvent::Closed(session_key, generation) => {
+                if !self.is_current_session(&session_key, generation) {
+                    return Ok(());
+                }
+
+                self.drop_session(&session_key, "tsgo child exited unexpectedly")?;
             }
         }
 
         Ok(())
+    }
+
+    fn is_current_session(&self, session_key: &SessionKey, generation: u64) -> bool {
+        self.sessions
+            .get(session_key)
+            .is_some_and(|session| session.generation == generation)
     }
 
     fn handle_initialize(&mut self, request: Request) -> Result<()> {
@@ -368,7 +398,7 @@ impl Proxy {
                     .as_ref()
                     .map(|error| format!("tsgo initialize failed: {}", error.message))
                     .unwrap_or_else(|| "tsgo initialize failed".to_owned());
-                self.drop_session(&route.session_key, &message, true)?;
+                self.drop_session(&route.session_key, &message)?;
             }
 
             return Ok(());
@@ -432,9 +462,20 @@ impl Proxy {
         let Ok(file_path) = uri.to_file_path() else {
             return Ok(self.default_session.clone());
         };
-        let context = self.discovery.context_for_uri_path(&file_path)?;
+        // A file we cannot resolve or spawn a session for must not take the
+        // whole proxy down with it; other projects keep working.
+        let context = match self.discovery.context_for_uri_path(&file_path) {
+            Ok(context) => context,
+            Err(error) => {
+                self.log_warning(format!("failed to resolve a tsgo session for {uri}: {error:#}"))?;
+                return Ok(None);
+            }
+        };
         let key = context.key.clone();
-        self.ensure_session(context, true)?;
+        if let Err(error) = self.ensure_session(context, true) {
+            self.log_warning(format!("failed to spawn tsgo for {uri}: {error:#}"))?;
+            return Ok(None);
+        }
         Ok(Some(key))
     }
 
@@ -477,13 +518,23 @@ impl Proxy {
 
     fn dispatch_to_session(&mut self, key: SessionKey, message: Message) -> Result<()> {
         let Some(session) = self.sessions.get_mut(&key) else {
-            return Err(anyhow!("attempted to route to a missing session"));
+            if let Message::Request(request) = message {
+                return self.respond_missing_target(request);
+            }
+            return self.log_warning(format!("dropped a message for a missing session: {key:?}"));
         };
 
-        if session.initialized {
-            session.send(message)?;
+        let sent = if session.initialized {
+            session.send(message)
         } else {
             session.queued_messages.push(message);
+            Ok(())
+        };
+
+        if sent.is_err() {
+            // The writer thread is gone, so the child is dead or dying; fail
+            // its pending requests instead of erroring out of the event loop.
+            self.drop_session(&key, "tsgo child stopped accepting messages")?;
         }
 
         Ok(())
@@ -503,12 +554,15 @@ impl Proxy {
         Ok(())
     }
 
-    fn broadcast_notification(&self, notification: Notification) {
-        for session in self.sessions.values() {
-            if session.initialized {
-                let _ = session.send(notification.clone().into());
-            }
+    fn broadcast_notification(&mut self, notification: Notification) -> Result<()> {
+        // Route through dispatch_to_session so sessions still waiting on
+        // their initialize response receive the notification once ready.
+        let keys = self.sessions.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            self.dispatch_to_session(key, notification.clone().into())?;
         }
+
+        Ok(())
     }
 
     fn broadcast_or_dispatch_initialized(&mut self, notification: Notification) -> Result<()> {
@@ -572,12 +626,7 @@ impl Proxy {
         ))
     }
 
-    fn drop_session(
-        &mut self,
-        session_key: &SessionKey,
-        message: &str,
-        terminate: bool,
-    ) -> Result<()> {
+    fn drop_session(&mut self, session_key: &SessionKey, message: &str) -> Result<()> {
         self.documents.retain(|_, key| key != session_key);
         self.workspace_watcher.unwatch(session_key);
 
@@ -632,8 +681,9 @@ impl Proxy {
         self.child_request_routes
             .retain(|_, route| &route.session_key != session_key);
 
-        let removed_session = self.sessions.remove(session_key);
-        if let (true, Some(mut session)) = (terminate, removed_session) {
+        if let Some(mut session) = self.sessions.remove(session_key) {
+            // Terminate even when the child exited on its own: the wait()
+            // inside reaps it, otherwise it lingers as a zombie.
             session.terminate();
         }
 

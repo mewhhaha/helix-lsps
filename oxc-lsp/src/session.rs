@@ -25,14 +25,15 @@ pub struct SessionId {
 
 #[derive(Debug)]
 pub enum SessionEvent {
-    Message(SessionId, Message),
-    Closed(SessionId),
+    Message(SessionId, u64, Message),
+    Closed(SessionId, u64),
 }
 
 pub struct Session {
     pub id: SessionId,
     pub root: Option<std::path::PathBuf>,
     pub initialized: bool,
+    pub generation: u64,
     pub queued_messages: Vec<Message>,
     writer: Sender<Message>,
     child: Child,
@@ -43,6 +44,7 @@ impl Session {
         id: SessionId,
         root: Option<std::path::PathBuf>,
         command_spec: &CommandSpec,
+        generation: u64,
         events: Sender<SessionEvent>,
     ) -> Result<Self> {
         let mut command = Command::new(&command_spec.program);
@@ -75,7 +77,7 @@ impl Session {
 
         let (writer, receiver) = crossbeam_channel::unbounded();
         if let Err(error) = spawn_writer(id.clone(), stdin, receiver)
-            .and_then(|()| spawn_reader(id.clone(), stdout, events.clone()))
+            .and_then(|()| spawn_reader(id.clone(), generation, stdout, events.clone()))
             .and_then(|()| spawn_stderr_logger(id.clone(), stderr))
         {
             terminate_child(&mut child);
@@ -92,6 +94,7 @@ impl Session {
             id,
             root,
             initialized: false,
+            generation,
             queued_messages: Vec::new(),
             writer,
             child,
@@ -158,7 +161,12 @@ fn spawn_writer(
     Ok(())
 }
 
-fn spawn_reader(id: SessionId, stdout: ChildStdout, events: Sender<SessionEvent>) -> Result<()> {
+fn spawn_reader(
+    id: SessionId,
+    generation: u64,
+    stdout: ChildStdout,
+    events: Sender<SessionEvent>,
+) -> Result<()> {
     thread::Builder::new()
         .name(format!("oxc-reader-{id:?}"))
         .spawn(move || {
@@ -168,7 +176,7 @@ fn spawn_reader(id: SessionId, stdout: ChildStdout, events: Sender<SessionEvent>
                 match Message::read(&mut stdout) {
                     Ok(Some(message)) => {
                         if events
-                            .send(SessionEvent::Message(id.clone(), message))
+                            .send(SessionEvent::Message(id.clone(), generation, message))
                             .is_err()
                         {
                             break;
@@ -182,7 +190,7 @@ fn spawn_reader(id: SessionId, stdout: ChildStdout, events: Sender<SessionEvent>
                 }
             }
 
-            let _ = events.send(SessionEvent::Closed(id));
+            let _ = events.send(SessionEvent::Closed(id, generation));
         })
         .context("failed to spawn oxc reader thread")?;
 

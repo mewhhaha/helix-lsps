@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -40,14 +40,28 @@ pub struct ProjectContext {
     pub format_command: Option<CommandSpec>,
 }
 
+/// Cache is never invalidated, so installing oxc tooling into a project that was
+/// already resolved as missing requires an LSP restart to be picked up.
 #[derive(Clone, Debug, Default)]
-pub struct Discovery;
+pub struct Discovery {
+    cache: HashMap<PathBuf, Option<ProjectContext>>,
+}
 
 struct ToolSpec {
     package_name: &'static str,
     executable_name: &'static str,
     args: &'static [&'static str],
 }
+
+/// A resolved tool command together with the project root that satisfied the
+/// resolution (the directory containing the `node_modules` the tool was found in).
+struct ResolvedCommand {
+    command: CommandSpec,
+    root: PathBuf,
+}
+
+/// Cap descendant BFS depth as a defensive measure against pathological trees.
+const MAX_DESCENDANT_DEPTH: usize = 32;
 
 const OXLINT: ToolSpec = ToolSpec {
     package_name: "oxlint",
@@ -62,16 +76,22 @@ const OXFMT: ToolSpec = ToolSpec {
 };
 
 impl Discovery {
-    pub fn maybe_context_for_uri_path(&self, file_path: &Path) -> Result<Option<ProjectContext>> {
-        if let Some(project) = discover_local_project(file_path)? {
-            return Ok(Some(project));
+    pub fn maybe_context_for_uri_path(
+        &mut self,
+        file_path: &Path,
+    ) -> Result<Option<ProjectContext>> {
+        let start_dir = normalize_start_dir(file_path)?.to_path_buf();
+        if let Some(cached) = self.cache.get(&start_dir) {
+            return Ok(cached.clone());
         }
 
-        discover_global_fallback(file_path)
+        let context = compute_context(file_path)?;
+        self.cache.insert(start_dir, context.clone());
+        Ok(context)
     }
 
     #[cfg(test)]
-    pub fn context_for_uri_path(&self, file_path: &Path) -> Result<ProjectContext> {
+    pub fn context_for_uri_path(&mut self, file_path: &Path) -> Result<ProjectContext> {
         self.maybe_context_for_uri_path(file_path)?.ok_or_else(|| {
             anyhow!(
                 "no oxlint installation is available for {}",
@@ -81,34 +101,35 @@ impl Discovery {
     }
 }
 
+fn compute_context(file_path: &Path) -> Result<Option<ProjectContext>> {
+    if let Some(project) = discover_local_project(file_path)? {
+        return Ok(Some(project));
+    }
+
+    discover_global_fallback(file_path)
+}
+
 fn discover_local_project(file_path: &Path) -> Result<Option<ProjectContext>> {
     let start_dir = normalize_start_dir(file_path)?;
 
+    // First, prefer an ancestor that owns a package.json: the project root is that
+    // ancestor even when tooling is hoisted higher up the tree.
     for candidate in start_dir.ancestors() {
         if !candidate.join("package.json").exists() {
             continue;
         }
 
-        if let Some(lint_command) = resolve_local_command(candidate, &OXLINT)? {
-            return Ok(Some(ProjectContext {
-                key: SessionKey::Project(candidate.to_path_buf()),
-                root: Some(candidate.to_path_buf()),
-                lint_command,
-                format_command: resolve_local_command(candidate, &OXFMT)?
-                    .or_else(|| resolve_global_command(&OXFMT)),
-            }));
+        if let Some(resolved) = resolve_local_command(candidate, &OXLINT)? {
+            return Ok(Some(project_context(candidate.to_path_buf(), candidate, resolved)?));
         }
     }
 
+    // Otherwise fall back to wherever tooling resolves from, rooting the project at
+    // the directory that actually satisfied resolution rather than the file's own dir.
     for candidate in start_dir.ancestors() {
-        if let Some(lint_command) = resolve_local_command(candidate, &OXLINT)? {
-            return Ok(Some(ProjectContext {
-                key: SessionKey::Project(candidate.to_path_buf()),
-                root: Some(candidate.to_path_buf()),
-                lint_command,
-                format_command: resolve_local_command(candidate, &OXFMT)?
-                    .or_else(|| resolve_global_command(&OXFMT)),
-            }));
+        if let Some(resolved) = resolve_local_command(candidate, &OXLINT)? {
+            let root = resolved.root.clone();
+            return Ok(Some(project_context(root, candidate, resolved)?));
         }
     }
 
@@ -122,24 +143,36 @@ fn discover_local_project(file_path: &Path) -> Result<Option<ProjectContext>> {
     Ok(None)
 }
 
+fn project_context(
+    root: PathBuf,
+    format_lookup_dir: &Path,
+    lint: ResolvedCommand,
+) -> Result<ProjectContext> {
+    Ok(ProjectContext {
+        key: SessionKey::Project(root.clone()),
+        root: Some(root),
+        lint_command: lint.command,
+        format_command: resolve_local_command(format_lookup_dir, &OXFMT)?
+            .map(|resolved| resolved.command)
+            .or_else(|| resolve_global_command(&OXFMT)),
+    })
+}
+
 fn discover_descendant_project(start_dir: &Path) -> Result<Option<ProjectContext>> {
     if !should_scan_descendants(start_dir) {
         return Ok(None);
     }
 
-    let mut queue = VecDeque::from([start_dir.to_path_buf()]);
-    while let Some(candidate) = queue.pop_front() {
-        if candidate.join("package.json").is_file() {
-            let lint_command = resolve_local_command(&candidate, &OXLINT)?;
-            if let Some(lint_command) = lint_command {
-                return Ok(Some(ProjectContext {
-                    key: SessionKey::Project(candidate.clone()),
-                    root: Some(candidate.clone()),
-                    lint_command,
-                    format_command: resolve_local_command(&candidate, &OXFMT)?
-                        .or_else(|| resolve_global_command(&OXFMT)),
-                }));
-            }
+    let mut queue = VecDeque::from([(start_dir.to_path_buf(), 0usize)]);
+    while let Some((candidate, depth)) = queue.pop_front() {
+        if candidate.join("package.json").is_file()
+            && let Some(resolved) = resolve_local_command(&candidate, &OXLINT)?
+        {
+            return Ok(Some(project_context(candidate.clone(), &candidate, resolved)?));
+        }
+
+        if depth >= MAX_DESCENDANT_DEPTH {
+            continue;
         }
 
         let Ok(entries) = fs::read_dir(&candidate) else {
@@ -147,11 +180,20 @@ fn discover_descendant_project(start_dir: &Path) -> Result<Option<ProjectContext
         };
 
         for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() || should_skip_descendant(&path) {
+            // `DirEntry::file_type` does not traverse symlinks, so symlinked
+            // directories are treated as non-directories and skipped, guarding
+            // against symlink cycles that would otherwise loop forever.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
                 continue;
             }
-            queue.push_back(path);
+            let path = entry.path();
+            if should_skip_descendant(&path) {
+                continue;
+            }
+            queue.push_back((path, depth + 1));
         }
     }
 
@@ -195,16 +237,19 @@ fn normalize_start_dir(file_path: &Path) -> Result<&Path> {
     })
 }
 
-fn resolve_local_command(candidate: &Path, tool: &ToolSpec) -> Result<Option<CommandSpec>> {
+fn resolve_local_command(candidate: &Path, tool: &ToolSpec) -> Result<Option<ResolvedCommand>> {
     let binary = candidate
         .join("node_modules")
         .join(".bin")
         .join(executable_name(tool.executable_name));
     if binary.exists() {
-        return Ok(Some(CommandSpec {
-            program: binary,
-            args: tool.args.iter().map(|arg| (*arg).to_owned()).collect(),
-            cwd: Some(candidate.to_path_buf()),
+        return Ok(Some(ResolvedCommand {
+            command: CommandSpec {
+                program: binary,
+                args: tool.args.iter().map(|arg| (*arg).to_owned()).collect(),
+                cwd: Some(candidate.to_path_buf()),
+            },
+            root: candidate.to_path_buf(),
         }));
     }
 
@@ -213,14 +258,31 @@ fn resolve_local_command(candidate: &Path, tool: &ToolSpec) -> Result<Option<Com
         .join(tool.package_name)
         .join("package.json");
     if package_json.exists() {
-        return package_command_from_package_json(candidate, package_json, tool);
+        return Ok(package_command_from_package_json(candidate, package_json, tool)?
+            .map(|command| ResolvedCommand {
+                command,
+                root: candidate.to_path_buf(),
+            }));
     }
 
     let Some(package_json) = resolve_package_json_with_node(candidate, tool.package_name)? else {
         return Ok(None);
     };
 
-    package_command_from_package_json(candidate, package_json, tool)
+    // Resolution walked up through `node_modules`, so root the project at the
+    // directory owning that `node_modules` rather than the file's own directory.
+    let root =
+        project_root_from_package_json(&package_json).unwrap_or_else(|| candidate.to_path_buf());
+    Ok(package_command_from_package_json(candidate, package_json, tool)?
+        .map(|command| ResolvedCommand { command, root }))
+}
+
+fn project_root_from_package_json(package_json: &Path) -> Option<PathBuf> {
+    package_json
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "node_modules"))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
 }
 
 fn package_command_from_package_json(
@@ -335,11 +397,56 @@ fn find_in_path(binary_name: String) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, path::PathBuf};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::tempdir;
 
-    use super::{Discovery, SessionKey};
+    use super::{Discovery, SessionKey, project_root_from_package_json};
+
+    #[test]
+    fn derives_project_root_from_resolved_package_location() {
+        assert_eq!(
+            project_root_from_package_json(Path::new("/a/b/node_modules/oxlint/package.json")),
+            Some(PathBuf::from("/a/b"))
+        );
+        // Nested node_modules: root at the directory owning the innermost one.
+        assert_eq!(
+            project_root_from_package_json(Path::new(
+                "/a/node_modules/x/node_modules/oxlint/package.json"
+            )),
+            Some(PathBuf::from("/a/node_modules/x"))
+        );
+        assert_eq!(
+            project_root_from_package_json(Path::new("/a/b/package.json")),
+            None
+        );
+    }
+
+    #[test]
+    fn caches_discovery_results_per_start_directory() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let package = root.join("project");
+        let source = package.join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(package.join("node_modules/.bin")).unwrap();
+        fs::write(package.join("package.json"), r#"{"name":"project"}"#).unwrap();
+        fs::write(package.join("node_modules/.bin/oxlint"), "#!/bin/sh\n").unwrap();
+
+        let mut discovery = Discovery::default();
+        let file = source.join("index.ts");
+        let first = discovery.maybe_context_for_uri_path(&file).unwrap();
+        assert!(first.is_some());
+
+        // Deleting the tooling should not change the answer for an already-resolved
+        // start directory: the cached result is returned without re-scanning.
+        fs::remove_dir_all(package.join("node_modules")).unwrap();
+        let cached = discovery.maybe_context_for_uri_path(&file).unwrap();
+        assert_eq!(cached, first);
+    }
 
     #[test]
     fn prefers_nearest_package_with_local_oxc_tools() {
@@ -355,7 +462,7 @@ mod tests {
         fs::write(package.join("node_modules/.bin/oxlint"), "#!/bin/sh\n").unwrap();
         fs::write(package.join("node_modules/.bin/oxfmt"), "#!/bin/sh\n").unwrap();
 
-        let discovery = Discovery;
+        let mut discovery = Discovery::default();
         let context = discovery
             .context_for_uri_path(&source.join("index.ts"))
             .unwrap();
@@ -388,7 +495,7 @@ mod tests {
             env::set_var("PATH", &bin_dir);
         }
 
-        let discovery = Discovery;
+        let mut discovery = Discovery::default();
         let context = discovery
             .context_for_uri_path(&source.join("index.ts"))
             .unwrap();
@@ -426,7 +533,7 @@ mod tests {
         .unwrap();
         fs::write(lint_package.join("bin/oxlint.js"), "console.log('fake');").unwrap();
 
-        let discovery = Discovery;
+        let mut discovery = Discovery::default();
         let context = discovery
             .context_for_uri_path(&source.join("index.ts"))
             .unwrap();
@@ -458,7 +565,7 @@ mod tests {
         fs::write(package.join("node_modules/.bin/oxlint"), "#!/bin/sh\n").unwrap();
         fs::write(package.join("node_modules/.bin/oxfmt"), "#!/bin/sh\n").unwrap();
 
-        let discovery = Discovery;
+        let mut discovery = Discovery::default();
         let context = discovery.context_for_uri_path(&workspace).unwrap();
 
         assert_eq!(context.key, SessionKey::Project(package.clone()));

@@ -170,6 +170,73 @@ fn does_not_escape_initialized_workspace_when_resolving_prettier() {
     harness.shutdown();
 }
 
+#[test]
+fn ignores_stale_did_change_with_older_version() {
+    let fixture = tempdir().unwrap();
+    let workspace_dir = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).unwrap();
+    install_echoing_prettier(&workspace_dir);
+
+    let file_path = workspace_dir.join("example.js");
+    fs::write(&file_path, "v1\n").unwrap();
+
+    let mut harness = LspHarness::spawn();
+    initialize_workspace(&mut harness, &workspace_dir);
+    open_document(&mut harness, &file_path, "v1\n");
+    change_document(&mut harness, &file_path, 3, "v3\n");
+    // Arrives late and behind the version we already hold, so it must be dropped.
+    change_document(&mut harness, &file_path, 2, "stale\n");
+
+    let formatting = format_document(&mut harness, &file_path);
+    assert_eq!(formatting["result"][0]["newText"], json!("formatted:v3\n"));
+
+    harness.shutdown();
+}
+
+#[test]
+fn declines_to_format_unopened_document() {
+    let fixture = tempdir().unwrap();
+    let workspace_dir = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).unwrap();
+    install_fake_prettier(&workspace_dir, "workspace prettier\n");
+
+    let file_path = workspace_dir.join("example.js");
+    fs::write(&file_path, "const answer = 42\n").unwrap();
+
+    let mut harness = LspHarness::spawn();
+    initialize_workspace(&mut harness, &workspace_dir);
+
+    // No didOpen: the server must not format against the on-disk copy.
+    let formatting = format_document(&mut harness, &file_path);
+    assert_eq!(formatting["result"], json!(null));
+
+    harness.shutdown();
+}
+
+#[test]
+fn honors_prettierignore_when_present() {
+    let fixture = tempdir().unwrap();
+    let workspace_dir = fixture.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).unwrap();
+    install_ignore_aware_prettier(&workspace_dir);
+    fs::write(workspace_dir.join(".prettierignore"), "example.js\n").unwrap();
+
+    let file_path = workspace_dir.join("example.js");
+    let input = "const answer = 42\n";
+    fs::write(&file_path, input).unwrap();
+
+    let mut harness = LspHarness::spawn();
+    initialize_workspace(&mut harness, &workspace_dir);
+    open_document(&mut harness, &file_path, input);
+
+    // The ignore-aware fake reports the file as ignored only when the bridge hands
+    // it an ignorePath, so an empty result proves .prettierignore was located.
+    let formatting = format_document(&mut harness, &file_path);
+    assert_eq!(formatting["result"], json!([]));
+
+    harness.shutdown();
+}
+
 fn install_fake_prettier(dir: &Path, formatted: &str) {
     let prettier_dir = dir.join("node_modules/prettier");
     fs::create_dir_all(&prettier_dir).unwrap();
@@ -184,6 +251,36 @@ fn install_fake_prettier(dir: &Path, formatted: &str) {
             "module.exports = {{\n  getFileInfo: async () => ({{ ignored: false, inferredParser: 'babel' }}),\n  resolveConfig: async () => null,\n  format: async () => {},\n}};\n",
             serde_json::to_string(formatted).unwrap()
         ),
+    )
+    .unwrap();
+}
+
+fn install_echoing_prettier(dir: &Path) {
+    let prettier_dir = dir.join("node_modules/prettier");
+    fs::create_dir_all(&prettier_dir).unwrap();
+    fs::write(
+        prettier_dir.join("package.json"),
+        "{\n  \"name\": \"prettier\",\n  \"version\": \"0.0.0-harness\",\n  \"main\": \"index.cjs\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        prettier_dir.join("index.cjs"),
+        "module.exports = {\n  getFileInfo: async () => ({ ignored: false, inferredParser: 'babel' }),\n  resolveConfig: async () => null,\n  format: async (source) => `formatted:${source}`,\n};\n",
+    )
+    .unwrap();
+}
+
+fn install_ignore_aware_prettier(dir: &Path) {
+    let prettier_dir = dir.join("node_modules/prettier");
+    fs::create_dir_all(&prettier_dir).unwrap();
+    fs::write(
+        prettier_dir.join("package.json"),
+        "{\n  \"name\": \"prettier\",\n  \"version\": \"0.0.0-harness\",\n  \"main\": \"index.cjs\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        prettier_dir.join("index.cjs"),
+        "module.exports = {\n  getFileInfo: async (filePath, options) => ({ ignored: Boolean(options && options.ignorePath), inferredParser: 'babel' }),\n  resolveConfig: async () => null,\n  format: async (source) => `formatted:${source}`,\n};\n",
     )
     .unwrap();
 }
@@ -239,6 +336,19 @@ fn change_workspace_folders(harness: &mut LspHarness, added: Vec<&Path>, removed
                     }))
                     .collect::<Vec<_>>()
             }
+        }),
+    );
+}
+
+fn change_document(harness: &mut LspHarness, file_path: &Path, version: i64, text: &str) {
+    harness.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": {
+                "uri": path_to_url(file_path).to_string(),
+                "version": version
+            },
+            "contentChanges": [{ "text": text }]
         }),
     );
 }
@@ -351,7 +461,9 @@ impl LspHarness {
 
         loop {
             let mut header = String::new();
-            self.stdout.read_line(&mut header).unwrap();
+            if self.stdout.read_line(&mut header).unwrap() == 0 {
+                panic!("language server closed stdout before responding");
+            }
 
             if header == "\r\n" {
                 break;

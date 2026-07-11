@@ -1,6 +1,7 @@
 use std::{
     io::{BufRead, BufReader, BufWriter},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     thread,
 };
 
@@ -11,14 +12,19 @@ use tracing::{error, info, warn};
 
 use crate::discovery::{ProjectContext, SessionKey};
 
+// Sessions can be dropped and respawned under the same key; the generation
+// lets the proxy ignore events from a previous child that shares the key.
+static NEXT_SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug)]
 pub enum SessionEvent {
-    Message(SessionKey, Message),
-    Closed(SessionKey),
+    Message(SessionKey, u64, Message),
+    Closed(SessionKey, u64),
 }
 
 pub struct Session {
     pub context: ProjectContext,
+    pub generation: u64,
     pub initialized: bool,
     pub queued_messages: Vec<Message>,
     writer: Sender<Message>,
@@ -55,9 +61,10 @@ impl Session {
             .take()
             .ok_or_else(|| anyhow!("failed to acquire child stderr"))?;
 
+        let generation = NEXT_SESSION_GENERATION.fetch_add(1, Ordering::Relaxed);
         let (writer, receiver) = crossbeam_channel::unbounded();
         if let Err(error) = spawn_writer(context.key.clone(), stdin, receiver)
-            .and_then(|()| spawn_reader(context.key.clone(), stdout, events.clone()))
+            .and_then(|()| spawn_reader(context.key.clone(), generation, stdout, events.clone()))
             .and_then(|()| spawn_stderr_logger(context.key.clone(), stderr))
         {
             terminate_child(&mut child);
@@ -72,6 +79,7 @@ impl Session {
 
         Ok(Self {
             context,
+            generation,
             initialized: false,
             queued_messages: Vec::new(),
             writer,
@@ -140,7 +148,12 @@ fn spawn_writer(
     Ok(())
 }
 
-fn spawn_reader(key: SessionKey, stdout: ChildStdout, events: Sender<SessionEvent>) -> Result<()> {
+fn spawn_reader(
+    key: SessionKey,
+    generation: u64,
+    stdout: ChildStdout,
+    events: Sender<SessionEvent>,
+) -> Result<()> {
     thread::Builder::new()
         .name(format!("tsgo-reader-{key:?}"))
         .spawn(move || {
@@ -150,7 +163,7 @@ fn spawn_reader(key: SessionKey, stdout: ChildStdout, events: Sender<SessionEven
                 match Message::read(&mut stdout) {
                     Ok(Some(message)) => {
                         if events
-                            .send(SessionEvent::Message(key.clone(), message))
+                            .send(SessionEvent::Message(key.clone(), generation, message))
                             .is_err()
                         {
                             break;
@@ -164,7 +177,7 @@ fn spawn_reader(key: SessionKey, stdout: ChildStdout, events: Sender<SessionEven
                 }
             }
 
-            let _ = events.send(SessionEvent::Closed(key));
+            let _ = events.send(SessionEvent::Closed(key, generation));
         })
         .context("failed to spawn tsgo reader thread")?;
 

@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -8,15 +9,34 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 
-const PACKAGE_NAME: &str = "@typescript/native-preview";
+const NATIVE_PREVIEW_PACKAGE: &str = "@typescript/native-preview";
+const TYPESCRIPT_PACKAGE: &str = "typescript";
+// TypeScript 7 is the first `typescript` release built on the native (tsgo)
+// compiler; earlier majors ship the JS compiler, which has no `--lsp` mode.
+const MINIMUM_TYPESCRIPT_MAJOR: u32 = 7;
 const RESOLVE_PACKAGE_SCRIPT: &str = r#"
 const base = process.argv[1];
-try {
-  const resolved = require.resolve("@typescript/native-preview/package.json", { paths: [base] });
-  process.stdout.write(resolved);
-} catch (error) {
+const resolve = (name) => {
+  try {
+    return require.resolve(`${name}/package.json`, { paths: [base] });
+  } catch (error) {
+    return null;
+  }
+};
+let resolved = resolve("@typescript/native-preview");
+if (!resolved) {
+  const typescript = resolve("typescript");
+  if (typescript) {
+    const { version } = JSON.parse(require("fs").readFileSync(typescript, "utf8"));
+    if (parseInt(version, 10) >= 7) {
+      resolved = typescript;
+    }
+  }
+}
+if (!resolved) {
   process.exit(1);
 }
+process.stdout.write(resolved);
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -147,8 +167,16 @@ fn enqueue_child_directories(dir: &Path, queue: &mut VecDeque<PathBuf>) {
     };
 
     let mut children = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_dir())
+        .filter_map(|entry| entry.ok())
+        // DirEntry::file_type does not follow symlinks; descending through
+        // them can loop forever on symlink cycles.
+        .filter(|entry| {
+            entry
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -164,7 +192,7 @@ fn discover_global_fallback(file_path: &Path) -> Result<ProjectContext> {
     let cwd = normalize_start_dir(file_path)?;
     let Some(program) = find_in_path(executable_name("tsgo")) else {
         return Err(anyhow!(
-            "could not find a local {PACKAGE_NAME} installation for {} and no global tsgo was available on PATH",
+            "could not find a local {NATIVE_PREVIEW_PACKAGE} or {TYPESCRIPT_PACKAGE} (>= {MINIMUM_TYPESCRIPT_MAJOR}) installation for {} and no global tsgo was available on PATH",
             file_path.display()
         ));
     };
@@ -174,7 +202,7 @@ fn discover_global_fallback(file_path: &Path) -> Result<ProjectContext> {
         root: None,
         command: CommandSpec {
             program,
-            args: vec!["--lsp".into(), "--stdio".into()],
+            args: lsp_args(),
             cwd: Some(cwd.to_path_buf()),
         },
     })
@@ -201,17 +229,23 @@ fn resolve_local_command(candidate: &Path) -> Result<Option<CommandSpec>> {
     if binary.exists() {
         return Ok(Some(CommandSpec {
             program: binary,
-            args: vec!["--lsp".into(), "--stdio".into()],
+            args: lsp_args(),
             cwd: Some(candidate.to_path_buf()),
         }));
     }
 
-    let package_json = candidate
-        .join("node_modules")
-        .join(PACKAGE_NAME)
-        .join("package.json");
-    if package_json.exists() {
-        return package_command_from_package_json(candidate, package_json);
+    for package_name in [NATIVE_PREVIEW_PACKAGE, TYPESCRIPT_PACKAGE] {
+        let package_json = candidate
+            .join("node_modules")
+            .join(package_name)
+            .join("package.json");
+        if !package_json.exists() {
+            continue;
+        }
+
+        if let Some(command) = package_command_from_package_json(candidate, package_json)? {
+            return Ok(Some(command));
+        }
     }
 
     let Some(package_json) = resolve_package_json_with_node(candidate)? else {
@@ -229,42 +263,124 @@ fn package_command_from_package_json(
         .with_context(|| format!("failed to read {}", package_json.display()))?;
     let package: Value = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {}", package_json.display()))?;
-    let relative_bin = package
-        .get("bin")
-        .and_then(|value| match value {
-            Value::String(bin) => Some(bin.as_str()),
-            Value::Object(map) => map.get("tsgo").and_then(Value::as_str),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "package {} does not declare a tsgo bin",
-                package_json.display()
-            )
-        })?;
+    let package_name = package
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(NATIVE_PREVIEW_PACKAGE);
+    if package_name == TYPESCRIPT_PACKAGE && !is_supported_typescript_version(&package) {
+        return Ok(None);
+    }
 
+    let bin_name = if package_name == TYPESCRIPT_PACKAGE {
+        "tsc"
+    } else {
+        "tsgo"
+    };
     let package_dir = package_json
         .parent()
         .ok_or_else(|| anyhow!("package path has no parent: {}", package_json.display()))?;
-    let binary = package_dir.join(relative_bin);
+
+    // The declared bin is a Node shim that spawns the real compiler as a
+    // child, which would be orphaned when we kill the session. Prefer the
+    // native binary from the platform package the shim itself would resolve.
+    if let Some(native) = find_platform_binary(package_dir, package_name, bin_name) {
+        return Ok(Some(CommandSpec {
+            program: native,
+            args: lsp_args(),
+            cwd: Some(candidate.to_path_buf()),
+        }));
+    }
+
+    let Some(relative_bin) = package.get("bin").and_then(|value| match value {
+        Value::String(bin) => Some(bin.as_str()),
+        Value::Object(map) => map.get(bin_name).and_then(Value::as_str),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    // Normalize away the leading `./` that npm bin entries conventionally use.
+    let binary = package_dir.join(relative_bin).components().collect::<PathBuf>();
 
     Ok(Some(if is_node_entrypoint(&binary) {
         CommandSpec {
             program: PathBuf::from("node"),
-            args: vec![
-                binary.to_string_lossy().into_owned(),
-                "--lsp".into(),
-                "--stdio".into(),
-            ],
+            args: std::iter::once(binary.to_string_lossy().into_owned())
+                .chain(lsp_args())
+                .collect(),
             cwd: Some(candidate.to_path_buf()),
         }
     } else {
         CommandSpec {
             program: binary,
-            args: vec!["--lsp".into(), "--stdio".into()],
+            args: lsp_args(),
             cwd: Some(candidate.to_path_buf()),
         }
     }))
+}
+
+fn lsp_args() -> Vec<String> {
+    vec!["--lsp".into(), "--stdio".into()]
+}
+
+fn is_supported_typescript_version(package: &Value) -> bool {
+    package
+        .get("version")
+        .and_then(Value::as_str)
+        .and_then(|version| version.split(['.', '-']).next())
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= MINIMUM_TYPESCRIPT_MAJOR)
+}
+
+fn find_platform_binary(package_dir: &Path, package_name: &str, bin_name: &str) -> Option<PathBuf> {
+    let platform = node_platform()?;
+    let arch = node_arch()?;
+    let base_name = package_name.rsplit('/').next()?;
+
+    // Canonicalize so pnpm's symlinked layout resolves to the virtual store,
+    // where the platform packages are siblings under the same node_modules.
+    let package_dir = fs::canonicalize(package_dir).unwrap_or_else(|_| package_dir.to_path_buf());
+    let node_modules = package_dir
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "node_modules"))?;
+
+    let binary = node_modules
+        .join("@typescript")
+        .join(format!("{base_name}-{platform}-{arch}"))
+        .join("lib")
+        .join(if cfg!(windows) {
+            format!("{bin_name}.exe")
+        } else {
+            bin_name.to_owned()
+        });
+
+    binary.is_file().then_some(binary)
+}
+
+fn node_platform() -> Option<&'static str> {
+    match env::consts::OS {
+        "linux" => Some("linux"),
+        "macos" => Some("darwin"),
+        "windows" => Some("win32"),
+        "freebsd" => Some("freebsd"),
+        "netbsd" => Some("netbsd"),
+        "openbsd" => Some("openbsd"),
+        "aix" => Some("aix"),
+        "solaris" | "illumos" => Some("sunos"),
+        _ => None,
+    }
+}
+
+fn node_arch() -> Option<&'static str> {
+    match env::consts::ARCH {
+        "x86_64" => Some("x64"),
+        "aarch64" => Some("arm64"),
+        "arm" => Some("arm"),
+        "powerpc64" => Some("ppc64"),
+        "s390x" => Some("s390x"),
+        "riscv64" => Some("riscv64"),
+        "loongarch64" => Some("loong64"),
+        _ => None,
+    }
 }
 
 fn resolve_package_json_with_node(candidate: &Path) -> Result<Option<PathBuf>> {
@@ -280,7 +396,7 @@ fn resolve_package_json_with_node(candidate: &Path) -> Result<Option<PathBuf>> {
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "failed to run node while resolving {PACKAGE_NAME} from {}",
+                    "failed to run node while resolving {NATIVE_PREVIEW_PACKAGE} or {TYPESCRIPT_PACKAGE} from {}",
                     candidate.display()
                 )
             });
@@ -300,10 +416,27 @@ fn resolve_package_json_with_node(candidate: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn is_node_entrypoint(path: &Path) -> bool {
-    matches!(
+    if matches!(
         path.extension().and_then(|value| value.to_str()),
         Some("js" | "cjs" | "mjs")
-    )
+    ) {
+        return true;
+    }
+
+    // typescript's `bin/tsc` is an extensionless Node script; detect it by
+    // shebang so it is launched via `node` (shebangs don't work on Windows).
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 64];
+    let Ok(bytes_read) = file.read(&mut head) else {
+        return false;
+    };
+    let first_line = head[..bytes_read]
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    first_line.starts_with(b"#!") && first_line.windows(4).any(|window| window == b"node")
 }
 
 fn executable_name(base: &str) -> String {
@@ -328,7 +461,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{Discovery, SessionKey};
+    use super::{Discovery, SessionKey, node_arch, node_platform, resolve_local_command};
 
     #[test]
     fn prefers_nearest_package_with_local_tsgo() {
@@ -411,6 +544,102 @@ mod tests {
             context.command.args[0],
             tsgo_package.join("bin/tsgo.js").to_string_lossy()
         );
+    }
+
+    #[test]
+    fn prefers_typescript_seven_platform_binary_over_bin_shim() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let package = root.join("project");
+        let source = package.join("src");
+        let typescript = package.join("node_modules/typescript");
+        let platform_package = package.join(format!(
+            "node_modules/@typescript/typescript-{}-{}",
+            node_platform().unwrap(),
+            node_arch().unwrap()
+        ));
+
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(typescript.join("bin")).unwrap();
+        fs::create_dir_all(platform_package.join("lib")).unwrap();
+        fs::write(package.join("package.json"), r#"{"name":"fixture"}"#).unwrap();
+        fs::write(
+            typescript.join("package.json"),
+            r#"{"name":"typescript","version":"7.0.2","bin":{"tsc":"./bin/tsc"}}"#,
+        )
+        .unwrap();
+        fs::write(typescript.join("bin/tsc"), "#!/usr/bin/env node\n").unwrap();
+        fs::write(platform_package.join("lib/tsc"), "").unwrap();
+
+        let discovery = Discovery;
+        let context = discovery
+            .context_for_uri_path(&source.join("index.ts"))
+            .unwrap();
+
+        assert_eq!(context.key, SessionKey::Project(package.clone()));
+        assert_eq!(
+            fs::canonicalize(&context.command.program).unwrap(),
+            fs::canonicalize(platform_package.join("lib/tsc")).unwrap()
+        );
+        assert_eq!(context.command.args, vec!["--lsp", "--stdio"]);
+    }
+
+    #[test]
+    fn falls_back_to_typescript_seven_bin_shim_when_platform_package_is_missing() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let package = root.join("project");
+        let source = package.join("src");
+        let typescript = package.join("node_modules/typescript");
+
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(typescript.join("bin")).unwrap();
+        fs::write(package.join("package.json"), r#"{"name":"fixture"}"#).unwrap();
+        fs::write(
+            typescript.join("package.json"),
+            r#"{"name":"typescript","version":"7.1.0-dev.20260710.1","bin":{"tsc":"./bin/tsc"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            typescript.join("bin/tsc"),
+            "#!/usr/bin/env node\nimport \"../lib/tsc.js\";\n",
+        )
+        .unwrap();
+
+        let discovery = Discovery;
+        let context = discovery
+            .context_for_uri_path(&source.join("index.ts"))
+            .unwrap();
+
+        assert_eq!(context.key, SessionKey::Project(package.clone()));
+        assert_eq!(context.command.program, PathBuf::from("node"));
+        assert_eq!(
+            context.command.args,
+            vec![
+                typescript.join("bin/tsc").to_string_lossy().into_owned(),
+                "--lsp".to_owned(),
+                "--stdio".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_typescript_installations_older_than_seven() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let package = root.join("project");
+        let typescript = package.join("node_modules/typescript");
+
+        fs::create_dir_all(typescript.join("bin")).unwrap();
+        fs::write(package.join("package.json"), r#"{"name":"fixture"}"#).unwrap();
+        fs::write(
+            typescript.join("package.json"),
+            r#"{"name":"typescript","version":"5.9.2","bin":{"tsc":"./bin/tsc","tsserver":"./bin/tsserver"}}"#,
+        )
+        .unwrap();
+        fs::write(typescript.join("bin/tsc"), "#!/usr/bin/env node\n").unwrap();
+
+        assert_eq!(resolve_local_command(&package).unwrap(), None);
     }
 
     #[test]

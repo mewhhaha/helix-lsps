@@ -391,6 +391,81 @@ fn slow_formatter_only_receives_initialized_once() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn survives_child_spawn_failure() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path();
+
+    // A project whose oxlint "binary" exists but is not executable, so spawning it
+    // fails with a permission error.
+    let project = root.join("broken");
+    let bin_dir = project.join("node_modules/.bin");
+    let src_dir = project.join("src");
+    fs::create_dir_all(&bin_dir)?;
+    fs::create_dir_all(&src_dir)?;
+    fs::write(project.join("package.json"), r#"{"name":"broken"}"#)?;
+    let oxlint = bin_dir.join("oxlint");
+    fs::write(&oxlint, "#!/bin/sh\nexit 0\n")?;
+    let mut permissions = fs::metadata(&oxlint)?.permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&oxlint, permissions)?;
+
+    let file = project.join("src/index.ts");
+    let file_uri = file_url(&file)?;
+    let root_uri = file_url(root)?;
+
+    // Initialize at a directory with no tooling so init stays silent and healthy.
+    let mut harness = Harness::spawn(Path::new(env!("CARGO_BIN_EXE_oxc-lsp")))?;
+    harness.send(Request::new(
+        RequestId::from(1),
+        "initialize".into(),
+        json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": {}
+        }),
+    ))?;
+    harness.expect_response(RequestId::from(1))?;
+    harness.send(Notification::new("initialized".into(), json!({})))?;
+
+    // A didOpen whose project fails to spawn must be contained, not fatal.
+    harness.send(Notification::new(
+        "textDocument/didOpen".into(),
+        json!({
+            "textDocument": {
+                "uri": file_uri.clone(),
+                "languageId": "typescript",
+                "version": 1,
+                "text": "export const a = 1;\n"
+            }
+        }),
+    ))?;
+
+    // A request for the same broken project gets an empty result, proving the proxy
+    // is still alive and serving requests after the spawn failure.
+    harness.send(Request::new(
+        RequestId::from(2),
+        "textDocument/formatting".into(),
+        json!({
+            "textDocument": {"uri": file_uri},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    ))?;
+    let formatting = harness.expect_response(RequestId::from(2))?;
+    assert_eq!(formatting.result.unwrap(), json!([]));
+
+    harness.send(Request::new(
+        RequestId::from(3),
+        "shutdown".into(),
+        json!(null),
+    ))?;
+    harness.expect_response(RequestId::from(3))?;
+    harness.send(Notification::new("exit".into(), json!(null)))?;
+    harness.wait()?;
+
+    Ok(())
+}
+
 fn create_project(
     root: &Path,
     name: &str,

@@ -3,7 +3,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -12,7 +13,17 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::Mutex,
+    time::timeout,
 };
+use tracing::warn;
+
+/// Node bridge script, embedded so installed binaries do not depend on the
+/// build-machine source tree. It is materialized to a temp file on first use.
+const ESLINT_BRIDGE: &str = include_str!("../node/eslint-bridge.mjs");
+
+/// Upper bound on a single lint round-trip. A hung eslint config must not wedge
+/// the worker mutex forever; expiry is treated as a restartable transport error.
+const WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 const FLAT_CONFIG_NAMES: &[&str] = &[
     "eslint.config.js",
@@ -94,8 +105,10 @@ pub struct LintMessage {
     pub rule_id: Option<String>,
     pub severity: u8,
     pub message: String,
-    pub line: u32,
-    pub column: u32,
+    // ESLint legitimately omits these for ignored-file warnings and fatal config
+    // errors, so decode must not fail (and kill the healthy worker) when absent.
+    pub line: Option<u32>,
+    pub column: Option<u32>,
     pub end_line: Option<u32>,
     pub end_column: Option<u32>,
 }
@@ -291,30 +304,39 @@ impl Worker {
         })?;
 
         let mut line = String::new();
-        process
-            .stdin
-            .write_all(payload.as_bytes())
-            .await
-            .context("failed to write request to eslint worker")?;
-        process
-            .stdin
-            .write_all(b"\n")
-            .await
-            .context("failed to flush request delimiter to eslint worker")?;
-        process
-            .stdout
-            .read_line(&mut line)
-            .await
-            .context("failed to read response from eslint worker")?;
+        let exchange = async {
+            process
+                .stdin
+                .write_all(payload.as_bytes())
+                .await
+                .context("failed to write request to eslint worker")?;
+            process
+                .stdin
+                .write_all(b"\n")
+                .await
+                .context("failed to flush request delimiter to eslint worker")?;
+            process
+                .stdout
+                .read_line(&mut line)
+                .await
+                .context("failed to read response from eslint worker")
+        };
 
-        if line.is_empty() {
+        let bytes_read = match timeout(WORKER_REQUEST_TIMEOUT, exchange).await {
+            Ok(result) => result?,
+            Err(_) => return Err(anyhow!("eslint worker timed out while handling the request")),
+        };
+
+        // A zero-length read is the only reliable signal that the worker closed
+        // stdout; a successfully framed response must not be discarded just
+        // because a one-shot child has since exited.
+        if bytes_read == 0 {
             return Err(anyhow!("eslint worker exited before replying"));
         }
 
-        if process.child.try_wait()?.is_some() {
-            return Err(anyhow!("eslint worker exited unexpectedly"));
-        }
-
+        // A well-framed response line that fails to decode indicates a bug in the
+        // payload, not a broken transport, so this deliberately is not treated as
+        // restart-worthy (see should_restart_worker_after).
         let envelope: BridgeEnvelope =
             serde_json::from_str(&line).context("failed to decode eslint worker response")?;
 
@@ -339,10 +361,31 @@ impl Worker {
     }
 }
 
+/// Materializes the embedded bridge script to a stable temp path once per
+/// process. Writing to a unique temp file and atomically renaming keeps
+/// concurrent worker spawns from observing a half-written script.
+fn bridge_script_path() -> Result<PathBuf> {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+
+    if let Some(path) = PATH.get() {
+        return Ok(path.clone());
+    }
+
+    let dir = std::env::temp_dir();
+    let target = dir.join(concat!("eslint-lsp-bridge-", env!("CARGO_PKG_VERSION"), ".mjs"));
+    let staging = dir.join(format!(".eslint-lsp-bridge-{}.mjs", std::process::id()));
+
+    fs::write(&staging, ESLINT_BRIDGE)
+        .with_context(|| format!("failed to write eslint bridge to {}", staging.display()))?;
+    fs::rename(&staging, &target)
+        .with_context(|| format!("failed to install eslint bridge at {}", target.display()))?;
+
+    let _ = PATH.set(target.clone());
+    Ok(target)
+}
+
 fn spawn_worker_process(key: &ProjectKey) -> Result<WorkerProcess> {
-    let bridge_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("node")
-        .join("eslint-bridge.mjs");
+    let bridge_path = bridge_script_path()?;
 
     let mut child = Command::new("node")
         .arg(bridge_path)
@@ -351,7 +394,9 @@ fn spawn_worker_process(key: &ProjectKey) -> Result<WorkerProcess> {
         .arg(key.config_format.as_bridge_value())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Inherit stderr so worker crashes and config errors stay debuggable
+        // instead of being silently swallowed.
+        .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .context("failed to spawn the eslint worker process")?;
@@ -397,7 +442,7 @@ fn should_restart_worker_after(error: &anyhow::Error) -> bool {
         || message.contains("failed to read response from eslint worker")
         || message.contains("eslint worker exited before replying")
         || message.contains("eslint worker exited unexpectedly")
-        || message.contains("failed to decode eslint worker response")
+        || message.contains("eslint worker timed out while handling the request")
         || message.contains("eslint worker response id mismatch")
 }
 
@@ -419,7 +464,7 @@ fn discover_project_roots(start_dir: &Path) -> Result<ProjectRoots> {
         }
 
         if contains_any(candidate, LEGACY_CONFIG_NAMES)
-            || package_json_has_eslint_config(candidate)?
+            || package_json_has_eslint_config(candidate)
         {
             return Ok(ProjectRoots {
                 cwd: candidate.to_path_buf(),
@@ -443,18 +488,31 @@ fn contains_any(dir: &Path, names: &[&str]) -> bool {
     names.iter().any(|name| dir.join(name).exists())
 }
 
-fn package_json_has_eslint_config(dir: &Path) -> Result<bool> {
+/// Reports whether the directory's package.json carries an inline eslintConfig.
+///
+/// A missing, unreadable, or unparseable package.json is treated as "no eslint
+/// config" (with a warning for the unreadable/unparseable cases) so a single bad
+/// file in the ancestor chain does not fail discovery and every subsequent lint.
+fn package_json_has_eslint_config(dir: &Path) -> bool {
     let package_json = dir.join("package.json");
-    if !package_json.exists() {
-        return Ok(false);
+
+    let raw = match fs::read_to_string(&package_json) {
+        Ok(raw) => raw,
+        Err(error) => {
+            if package_json.exists() {
+                warn!("failed to read {}: {error}", package_json.display());
+            }
+            return false;
+        }
+    };
+
+    match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(value) => value.get("eslintConfig").is_some(),
+        Err(error) => {
+            warn!("failed to parse {}: {error}", package_json.display());
+            false
+        }
     }
-
-    let raw = fs::read_to_string(&package_json)
-        .with_context(|| format!("failed to read {}", package_json.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {}", package_json.display()))?;
-
-    Ok(value.get("eslintConfig").is_some())
 }
 
 #[cfg(test)]
@@ -578,11 +636,30 @@ mod tests {
             "eslint worker exited before replying"
         )));
         assert!(should_restart_worker_after(&anyhow!(
+            "eslint worker timed out while handling the request"
+        )));
+        // A well-framed response that fails to decode means the payload is wrong,
+        // not the transport, so the healthy worker must be kept alive.
+        assert!(!should_restart_worker_after(&anyhow!(
             "failed to decode eslint worker response"
         )));
         assert!(!should_restart_worker_after(&anyhow!(
             "ESLint failed while evaluating the local project setup"
         )));
+    }
+
+    #[test]
+    fn ignores_malformed_package_json_during_discovery() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let nested = root.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        // A broken package.json in the ancestor chain must not fail discovery.
+        fs::write(root.join("package.json"), "{ this is not json").unwrap();
+
+        let roots = discover_project_roots(&nested).unwrap();
+        assert_eq!(roots.cwd, root);
+        assert_eq!(roots.config_format, ConfigFormat::Default);
     }
 
     #[cfg(unix)]
