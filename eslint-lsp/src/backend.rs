@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use serde_json::Value;
 use tower_lsp::{
@@ -6,12 +13,13 @@ use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
         CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-        CodeActionProviderCapability, Command, Diagnostic, DiagnosticSeverity,
+        CodeActionProviderCapability, Command, Diagnostic, DiagnosticSeverity, DocumentChanges,
         DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
         DidSaveTextDocumentParams, DocumentFormattingParams, ExecuteCommandOptions,
         ExecuteCommandParams, InitializeParams, InitializeResult, InitializedParams, MessageType,
-        OneOf, Position, Range, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-        TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Url, WorkspaceEdit,
+        OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, ServerCapabilities,
+        ServerInfo, TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind,
+        TextDocumentSyncOptions, TextEdit, Url, WorkspaceEdit,
     },
 };
 use tracing::warn;
@@ -33,6 +41,11 @@ struct Document {
 struct State {
     documents: Mutex<HashMap<Url, Document>>,
     lint_generations: Mutex<HashMap<Url, u64>>,
+    // Process-wide monotonic source for generation numbers. Drawing from a
+    // counter that never resets (rather than a per-document count that restarts
+    // at 1 on reopen) prevents a stale in-flight lint from ever matching the
+    // generation of a freshly reopened document (ABA).
+    lint_counter: AtomicU64,
     resolver: Resolver,
 }
 
@@ -51,12 +64,11 @@ impl Backend {
     }
 
     async fn schedule_lint(&self, uri: Url) {
-        let generation = {
+        let generation = self.state.lint_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        {
             let mut generations = self.state.lint_generations.lock().await;
-            let next = generations.get(&uri).copied().unwrap_or(0) + 1;
-            generations.insert(uri.clone(), next);
-            next
-        };
+            generations.insert(uri.clone(), generation);
+        }
 
         let backend = self.clone();
         tokio::spawn(async move {
@@ -158,11 +170,13 @@ impl Backend {
         self.state.lint_generations.lock().await.get(uri).copied() == Some(generation)
     }
 
-    async fn compute_fix_edit(&self, uri: &Url) -> Option<TextEdit> {
+    /// Computes an eslint fix-all edit, returning the document version the edit
+    /// was derived from so callers can attach it to a versioned workspace edit.
+    async fn compute_fix_edit(&self, uri: &Url) -> Option<(i32, TextEdit)> {
         let document = self.get_document(uri).await?;
         let file_path = uri.to_file_path().ok()?;
 
-        let response = self
+        let response = match self
             .state
             .resolver
             .lint(LintRequest {
@@ -171,17 +185,38 @@ impl Backend {
                 fix: true,
             })
             .await
-            .ok()?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("failed to compute ESLint fixes: {error}"),
+                    )
+                    .await;
+                return None;
+            }
+        };
+
+        // The lint ran against a snapshot; if the user edited the document while
+        // we were linting, applying this edit would clobber their changes.
+        let current = self.get_document(uri).await?;
+        if current.version != document.version {
+            return None;
+        }
 
         let fixed_text = response.fixed_text?;
         if fixed_text == document.text {
             return None;
         }
 
-        Some(TextEdit {
-            range: full_document_range(&document.text),
-            new_text: fixed_text,
-        })
+        Some((
+            document.version,
+            TextEdit {
+                range: full_document_range(&document.text),
+                new_text: fixed_text,
+            },
+        ))
     }
 }
 
@@ -311,16 +346,26 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let Some(edit) = self.compute_fix_edit(&uri).await else {
+        let Some((version, edit)) = self.compute_fix_edit(&uri).await else {
             return Ok(None);
+        };
+
+        // Use a versioned document edit so the client rejects the fix if the
+        // document moved on between computing and applying it.
+        let workspace_edit = WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(vec![TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri,
+                    version: Some(version),
+                },
+                edits: vec![OneOf::Left(edit)],
+            }])),
+            ..WorkspaceEdit::default()
         };
 
         match self
             .client
-            .apply_edit(WorkspaceEdit {
-                changes: Some(HashMap::from([(uri, vec![edit])])),
-                ..WorkspaceEdit::default()
-            })
+            .apply_edit(workspace_edit)
             .await
         {
             Ok(response) if response.applied => {}
@@ -344,7 +389,7 @@ impl LanguageServer for Backend {
         Ok(self
             .compute_fix_edit(&params.text_document.uri)
             .await
-            .map(|edit| vec![edit]))
+            .map(|(_, edit)| vec![edit]))
     }
 }
 
@@ -392,17 +437,19 @@ fn synthetic_diagnostic(message: String) -> Diagnostic {
 }
 
 fn to_lsp_diagnostic(message: LintMessage) -> Diagnostic {
+    // ESLint omits line/column for whole-file diagnostics (ignored files, fatal
+    // config errors); default those to 1:1 as the rest of the mapping expects.
+    let line = message.line.unwrap_or(1);
+    let column = message.column.unwrap_or(1);
+
     Diagnostic {
         range: Range::new(
+            Position::new(line.saturating_sub(1), column.saturating_sub(1)),
             Position::new(
-                message.line.saturating_sub(1),
-                message.column.saturating_sub(1),
-            ),
-            Position::new(
-                message.end_line.unwrap_or(message.line).saturating_sub(1),
+                message.end_line.unwrap_or(line).saturating_sub(1),
                 message
                     .end_column
-                    .unwrap_or(message.column.saturating_add(1))
+                    .unwrap_or(column.saturating_add(1))
                     .saturating_sub(1),
             ),
         ),
@@ -423,12 +470,22 @@ fn full_document_range(text: &str) -> Range {
     let mut line = 0u32;
     let mut column = 0u32;
 
-    for ch in text.chars() {
-        if ch == '\n' {
-            line += 1;
-            column = 0;
-        } else {
-            column += ch.len_utf16() as u32;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\n' => {
+                line += 1;
+                column = 0;
+            }
+            '\r' => {
+                // Treat a lone \r (classic Mac) and \r\n as a single line break.
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                line += 1;
+                column = 0;
+            }
+            _ => column += ch.len_utf16() as u32,
         }
     }
 
@@ -470,6 +527,18 @@ mod tests {
     fn range_covers_document_with_trailing_newline() {
         let range = full_document_range("const value = 1;\n");
         assert_eq!(range.end, Position::new(1, 0));
+    }
+
+    #[test]
+    fn range_treats_lone_carriage_return_as_line_break() {
+        let range = full_document_range("a\rb");
+        assert_eq!(range.end, Position::new(1, 1));
+    }
+
+    #[test]
+    fn range_treats_crlf_as_single_line_break() {
+        let range = full_document_range("a\r\nb");
+        assert_eq!(range.end, Position::new(1, 1));
     }
 
     #[test]
