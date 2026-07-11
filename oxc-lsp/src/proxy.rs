@@ -53,6 +53,7 @@ struct Proxy {
     client_initialize: Option<ClientInitializeState>,
     default_project: Option<SessionKey>,
     internal_request_counter: usize,
+    session_generation: u64,
     events_tx: Sender<SessionEvent>,
     events_rx: Receiver<SessionEvent>,
     shutdown_requested: bool,
@@ -80,7 +81,7 @@ impl Proxy {
 
         Self {
             connection,
-            discovery: Discovery,
+            discovery: Discovery::default(),
             sessions: HashMap::new(),
             documents: HashMap::new(),
             client_request_routes: HashMap::new(),
@@ -89,6 +90,7 @@ impl Proxy {
             client_initialize: None,
             default_project: None,
             internal_request_counter: 0,
+            session_generation: 0,
             events_tx,
             events_rx,
             shutdown_requested: false,
@@ -140,7 +142,28 @@ impl Proxy {
                     return Ok(false);
                 }
 
-                let target = self.resolve_target_for_request(&request)?;
+                if self.shutdown_requested {
+                    self.connection.sender.send(
+                        Response::new_err(
+                            request.id,
+                            ErrorCode::InvalidRequest as i32,
+                            "server is shutting down".to_owned(),
+                        )
+                        .into(),
+                    )?;
+                    return Ok(false);
+                }
+
+                // Spawn failures while resolving the target must not tear down the proxy:
+                // log and answer with an empty/absent result instead.
+                let target = match self.resolve_target_for_request(&request) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        self.log_warning(format!("failed to resolve request target: {error}"))?;
+                        self.respond_missing_target(request)?;
+                        return Ok(false);
+                    }
+                };
                 let Some(target) = target else {
                     self.respond_missing_target(request)?;
                     return Ok(false);
@@ -148,7 +171,14 @@ impl Proxy {
 
                 self.client_request_routes
                     .insert(request.id.clone(), target.clone());
-                self.dispatch_to_session(target, request.into())?;
+                // A send failure means the child died; treat it as a session death so the
+                // pending request is answered with an error rather than crashing the proxy.
+                if let Err(error) = self.dispatch_to_session(target.clone(), request.into()) {
+                    self.drop_session(
+                        &target,
+                        &format!("failed to forward request to child: {error}"),
+                    )?;
+                }
             }
             Message::Notification(notification) => {
                 if notification.method == "initialized" {
@@ -158,7 +188,7 @@ impl Proxy {
                 }
 
                 if notification.method == "exit" {
-                    self.broadcast_notification(notification);
+                    self.broadcast_notification(notification)?;
                     return Ok(true);
                 }
 
@@ -166,11 +196,26 @@ impl Proxy {
                     self.handle_cancel_notification(&notification)?;
                 }
 
-                match self.resolve_target_for_notification(&notification)? {
+                if self.shutdown_requested {
+                    return Ok(false);
+                }
+
+                // Spawn failures while resolving the target must not tear down the proxy:
+                // log and drop the notification instead.
+                let dispatch = match self.resolve_target_for_notification(&notification) {
+                    Ok(dispatch) => dispatch,
+                    Err(error) => {
+                        self.log_warning(format!(
+                            "failed to resolve notification target: {error}"
+                        ))?;
+                        return Ok(false);
+                    }
+                };
+                match dispatch {
                     Dispatch::Single(project_key) => {
                         self.dispatch_project_notification(project_key, notification)?
                     }
-                    Dispatch::Broadcast => self.broadcast_notification(notification),
+                    Dispatch::Broadcast => self.broadcast_notification(notification)?,
                     Dispatch::None => {}
                 }
             }
@@ -193,23 +238,42 @@ impl Proxy {
 
     fn handle_session_event(&mut self, event: SessionEvent) -> Result<()> {
         match event {
-            SessionEvent::Message(session_id, message) => match message {
-                Message::Request(request) => self.handle_child_request(session_id, request)?,
-                Message::Response(response) => self.handle_child_response(session_id, response)?,
-                Message::Notification(notification) => {
-                    self.connection.sender.send(notification.into())?;
+            SessionEvent::Message(session_id, generation, message) => {
+                // Ignore leftovers from a previous child that shared this session id.
+                if !self.session_generation_matches(&session_id, generation) {
+                    return Ok(());
                 }
-            },
-            SessionEvent::Closed(session_id) => {
+                match message {
+                    Message::Request(request) => self.handle_child_request(session_id, request)?,
+                    Message::Response(response) => {
+                        self.handle_child_response(session_id, response)?
+                    }
+                    Message::Notification(notification) => {
+                        self.connection.sender.send(notification.into())?;
+                    }
+                }
+            }
+            SessionEvent::Closed(session_id, generation) => {
+                // A stale Closed event from a killed child must not tear down a healthy
+                // session that was respawned under the same id.
+                if !self.session_generation_matches(&session_id, generation) {
+                    return Ok(());
+                }
                 let message = match session_id.kind {
                     ChildKind::Lint => "oxlint child exited unexpectedly",
                     ChildKind::Format => "oxfmt child exited unexpectedly",
                 };
-                self.drop_session(&session_id, message, false)?;
+                self.drop_session(&session_id, message)?;
             }
         }
 
         Ok(())
+    }
+
+    fn session_generation_matches(&self, session_id: &SessionId, generation: u64) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_some_and(|session| session.generation == generation)
     }
 
     fn handle_initialize(&mut self, request: Request) -> Result<()> {
@@ -334,13 +398,13 @@ impl Proxy {
                     .as_ref()
                     .map(|message| format!("oxlint initialize failed: {message}"))
                     .unwrap_or_else(|| "oxlint initialize failed".to_owned());
-                self.drop_session(&route.session_id, &message, true)?;
+                self.drop_session(&route.session_id, &message)?;
             } else {
                 let message = initialize_error_message
                     .as_ref()
                     .map(|message| format!("oxfmt initialize failed: {message}"))
                     .unwrap_or_else(|| "oxfmt initialize failed".to_owned());
-                self.drop_session(&route.session_id, &message, true)?;
+                self.drop_session(&route.session_id, &message)?;
             }
 
             return Ok(());
@@ -387,12 +451,9 @@ impl Proxy {
 
         if let Some(uri) = find_uri(&notification.params) {
             if notification.method == "textDocument/didClose" {
-                let target = self
-                    .documents
-                    .get(uri.as_str())
-                    .cloned()
-                    .or_else(|| self.resolve_target_for_uri(&uri).ok().flatten());
-                self.documents.remove(uri.as_str());
+                // Only route the close to a session that already owns the document.
+                // Never spawn a brand-new child just to deliver a didClose.
+                let target = self.documents.remove(uri.as_str());
                 return Ok(target.map_or(Dispatch::None, Dispatch::Single));
             }
 
@@ -480,10 +541,12 @@ impl Proxy {
             return Ok(());
         }
 
+        self.session_generation += 1;
         let session = Session::spawn(
             session_id.clone(),
             root.clone(),
             command_spec,
+            self.session_generation,
             self.events_tx.clone(),
         )?;
 
@@ -545,7 +608,16 @@ impl Proxy {
             };
 
             if self.sessions.contains_key(&session_id) {
-                self.dispatch_to_session(session_id, notification.clone().into())?;
+                // A send failure means the child died; drop the session rather than
+                // bubbling the error out of the event loop.
+                if let Err(error) =
+                    self.dispatch_to_session(session_id.clone(), notification.clone().into())
+                {
+                    self.drop_session(
+                        &session_id,
+                        &format!("failed to forward notification to child: {error}"),
+                    )?;
+                }
             }
         }
 
@@ -566,12 +638,22 @@ impl Proxy {
         Ok(())
     }
 
-    fn broadcast_notification(&self, notification: Notification) {
-        for session in self.sessions.values() {
-            if session.initialized {
-                let _ = session.send(notification.clone().into());
+    fn broadcast_notification(&mut self, notification: Notification) -> Result<()> {
+        // Route through the queueing dispatch path so uninitialized sessions receive
+        // the notification once they finish initializing instead of dropping it.
+        let session_ids = self.sessions.keys().cloned().collect::<Vec<_>>();
+        for session_id in session_ids {
+            if let Err(error) =
+                self.dispatch_to_session(session_id.clone(), notification.clone().into())
+            {
+                self.drop_session(
+                    &session_id,
+                    &format!("failed to broadcast notification to child: {error}"),
+                )?;
             }
         }
+
+        Ok(())
     }
 
     fn broadcast_or_dispatch_initialized(&mut self, notification: Notification) -> Result<()> {
@@ -592,7 +674,7 @@ impl Proxy {
         }
     }
 
-    fn handle_cancel_notification(&self, notification: &Notification) -> Result<()> {
+    fn handle_cancel_notification(&mut self, notification: &Notification) -> Result<()> {
         let Some(cancelled_id) = notification
             .params
             .get("id")
@@ -601,12 +683,31 @@ impl Proxy {
             return Ok(());
         };
 
-        let Some(session_id) = self.client_request_routes.get(&cancelled_id) else {
+        let Some(session_id) = self.client_request_routes.get(&cancelled_id).cloned() else {
             return Ok(());
         };
-        let Some(session) = self.sessions.get(session_id) else {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
             return Ok(());
         };
+
+        // If the target request is still queued (child not yet initialized), the child
+        // never saw it, so forwarding the cancel would be a no-op. Drop it from the queue
+        // and synthesize a RequestCanceled response for the client instead.
+        if let Some(position) = session.queued_messages.iter().position(|message| {
+            matches!(message, Message::Request(queued) if queued.id == cancelled_id)
+        }) {
+            session.queued_messages.remove(position);
+            self.client_request_routes.remove(&cancelled_id);
+            self.connection.sender.send(
+                Response::new_err(
+                    cancelled_id,
+                    ErrorCode::RequestCanceled as i32,
+                    "request cancelled".to_owned(),
+                )
+                .into(),
+            )?;
+            return Ok(());
+        }
 
         session.send(notification.clone().into())?;
 
@@ -635,12 +736,7 @@ impl Proxy {
         ))
     }
 
-    fn drop_session(
-        &mut self,
-        session_id: &SessionId,
-        message: &str,
-        terminate: bool,
-    ) -> Result<()> {
+    fn drop_session(&mut self, session_id: &SessionId, message: &str) -> Result<()> {
         if session_id.kind == ChildKind::Lint {
             self.documents.retain(|_, key| key != &session_id.project);
         }
@@ -696,8 +792,9 @@ impl Proxy {
         self.child_request_routes
             .retain(|_, route| &route.session_id != session_id);
 
-        let removed_session = self.sessions.remove(session_id);
-        if let (true, Some(mut session)) = (terminate, removed_session) {
+        // Always terminate on removal: children that exited on their own still need a
+        // wait() to be reaped. Session::terminate() is safe for an already-exited child.
+        if let Some(mut session) = self.sessions.remove(session_id) {
             session.terminate();
         }
 
