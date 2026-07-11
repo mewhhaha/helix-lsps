@@ -23,7 +23,7 @@ use crate::formatter::{FormatOutcome, Formatter};
 pub struct Backend {
     client: Client,
     formatter: Arc<dyn Formatter>,
-    documents: RwLock<HashMap<Url, String>>,
+    documents: RwLock<HashMap<Url, (i32, String)>>,
     workspace_roots: RwLock<Vec<PathBuf>>,
 }
 
@@ -37,15 +37,12 @@ impl Backend {
         }
     }
 
-    async fn document_text(&self, uri: &Url, file_path: &PathBuf) -> Result<String> {
-        if let Some(text) = self.documents.read().await.get(uri).cloned() {
-            return Ok(text);
-        }
-
-        tokio::fs::read_to_string(file_path).await.map_err(|error| {
-            error!("failed reading {}: {error}", file_path.display());
-            Error::internal_error()
-        })
+    async fn document_text(&self, uri: &Url) -> Option<String> {
+        self.documents
+            .read()
+            .await
+            .get(uri)
+            .map(|(_, text)| text.clone())
     }
 
     async fn workspace_root_for(&self, file_path: &Path) -> Option<PathBuf> {
@@ -107,16 +104,25 @@ impl LanguageServer for Backend {
         self.documents
             .write()
             .await
-            .insert(text_document.uri, text_document.text);
+            .insert(text_document.uri, (text_document.version, text_document.text));
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        if let Some(change) = params.content_changes.into_iter().last() {
-            self.documents
-                .write()
-                .await
-                .insert(params.text_document.uri, change.text);
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
+        let uri = params.text_document.uri;
+        let version = params.text_document.version;
+
+        let mut documents = self.documents.write().await;
+        // Drop changes that arrive out of order behind a newer version we already hold.
+        if documents
+            .get(&uri)
+            .is_some_and(|(current, _)| *current > version)
+        {
+            return;
         }
+        documents.insert(uri, (version, change.text));
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -131,7 +137,11 @@ impl LanguageServer for Backend {
         let file_path = uri
             .to_file_path()
             .map_err(|()| Error::invalid_params("prettier-lsp only supports file URIs"))?;
-        let source = self.document_text(&uri, &file_path).await?;
+        let Some(source) = self.document_text(&uri).await else {
+            // The document is not open; formatting from disk could clobber unsaved
+            // editor state, so decline instead of guessing.
+            return Ok(None);
+        };
         let workspace_root = self.workspace_root_for(&file_path).await;
 
         match self

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -53,6 +54,34 @@ function resolvePrettier(targetFilePath, workspaceRoot) {
   throw lastError ?? new Error(`could not resolve prettier for ${targetFilePath}`);
 }
 
+function findIgnorePath(targetFilePath, workspaceRoot) {
+  const stopDir = isWithinRoot(workspaceRoot, targetFilePath)
+    ? workspaceRoot
+    : null;
+
+  let currentDir = dirname(targetFilePath);
+
+  while (true) {
+    const candidate = join(currentDir, ".prettierignore");
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+
+    if (stopDir && currentDir === stopDir) {
+      break;
+    }
+
+    const parentDir = dirname(currentDir);
+    if (parentDir === currentDir) {
+      break;
+    }
+
+    currentDir = parentDir;
+  }
+
+  return null;
+}
+
 async function loadPrettier(targetFilePath, workspaceRoot) {
   const resolved = resolvePrettier(targetFilePath, workspaceRoot);
 
@@ -89,21 +118,26 @@ async function handleRequest(request) {
     return formatError("missing_prettier", error);
   }
 
+  const ignorePath = findIgnorePath(filePath, workspaceRoot);
   const fileInfo = await prettier.getFileInfo(filePath, {
-    resolveConfig: false,
     withNodeModules: false,
+    ...(ignorePath ? { ignorePath } : {}),
   });
 
   if (fileInfo.ignored) {
     return { kind: "ignored" };
   }
 
-  if (!fileInfo.inferredParser) {
+  const config =
+    (await prettier.resolveConfig(filePath, { editorconfig: true })) ?? {};
+
+  // getFileInfo infers the parser from the filename alone, so parsers assigned
+  // through config `overrides` (e.g. *.svelte) only show up on the resolved
+  // config. Fall back to it before declaring the file unsupported.
+  if (!fileInfo.inferredParser && !config.parser) {
     return { kind: "unsupported" };
   }
 
-  const config =
-    (await prettier.resolveConfig(filePath, { editorconfig: true })) ?? {};
   const formatted = await prettier.format(source, {
     ...config,
     filepath: filePath,

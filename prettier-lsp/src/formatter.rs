@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -14,9 +15,14 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, RwLock},
+    time::timeout,
 };
 
 const PRETTIER_BRIDGE: &str = include_str!("prettier_bridge.mjs");
+
+/// Upper bound on how long a single format round-trip may take before the worker
+/// is treated as wedged. One hung prettier plugin must not stall the workspace.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 #[async_trait]
 pub trait Formatter: Send + Sync {
@@ -72,6 +78,7 @@ impl std::error::Error for FormatError {}
 #[derive(Debug)]
 pub struct NodePrettierFormatter {
     node_binary: OsString,
+    request_timeout: Duration,
     workers: RwLock<HashMap<PathBuf, Arc<WorkspaceWorker>>>,
 }
 
@@ -79,8 +86,15 @@ impl NodePrettierFormatter {
     pub fn new(node_binary: impl Into<OsString>) -> Self {
         Self {
             node_binary: node_binary.into(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             workers: RwLock::new(HashMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
     }
 
     async fn worker_for(&self, workspace_dir: &Path) -> Result<Arc<WorkspaceWorker>, FormatError> {
@@ -88,7 +102,11 @@ impl NodePrettierFormatter {
             return Ok(worker);
         }
 
-        let worker = Arc::new(WorkspaceWorker::spawn(&self.node_binary, workspace_dir)?);
+        let worker = Arc::new(WorkspaceWorker::spawn(
+            &self.node_binary,
+            workspace_dir,
+            self.request_timeout,
+        )?);
         let mut workers = self.workers.write().await;
 
         Ok(workers
@@ -134,17 +152,22 @@ struct NodeBridgeRequest<'a> {
 #[derive(Debug)]
 struct WorkspaceWorker {
     state: Mutex<WorkerState>,
+    request_timeout: Duration,
 }
 
 #[derive(Debug)]
 struct WorkerState {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
 impl WorkspaceWorker {
-    fn spawn(node_binary: &OsString, workspace_dir: &Path) -> Result<Self, FormatError> {
+    fn spawn(
+        node_binary: &OsString,
+        workspace_dir: &Path,
+        request_timeout: Duration,
+    ) -> Result<Self, FormatError> {
         let mut child = Command::new(node_binary)
             .current_dir(workspace_dir)
             .arg("--input-type=module")
@@ -152,7 +175,9 @@ impl WorkspaceWorker {
             .arg(PRETTIER_BRIDGE)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Surface worker crashes on our own stderr, which the LSP client treats
+            // as the diagnostics channel; a silenced worker is undebuggable.
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .map_err(|error| {
@@ -176,10 +201,11 @@ impl WorkspaceWorker {
 
         Ok(Self {
             state: Mutex::new(WorkerState {
-                _child: child,
+                child,
                 stdin,
                 stdout,
             }),
+            request_timeout,
         })
     }
 
@@ -197,6 +223,24 @@ impl WorkspaceWorker {
         .map_err(|error| FormatError::new(format!("failed to serialize request: {error}")))?;
 
         let mut state = self.state.lock().await;
+        match timeout(self.request_timeout, Self::exchange(&mut state, &payload)).await {
+            Ok(result) => result,
+            Err(_) => {
+                // The worker is wedged. Kill it so the caller's restart path spawns a
+                // fresh one instead of blocking every future format on the dead child.
+                let _ = state.child.start_kill();
+                Err(FormatError::new(format!(
+                    "node worker timed out after {:?}",
+                    self.request_timeout
+                )))
+            }
+        }
+    }
+
+    async fn exchange(
+        state: &mut WorkerState,
+        payload: &str,
+    ) -> Result<NodeBridgeResponse, FormatError> {
         state
             .stdin
             .write_all(payload.as_bytes())
@@ -302,7 +346,7 @@ mod tests {
     use super::{
         Formatter, NodeBridgeResponse, NodePrettierFormatter, map_response, resolve_workspace_dir,
     };
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
     use tempfile::{TempDir, tempdir, tempdir_in};
 
     #[test]
@@ -408,6 +452,36 @@ mod tests {
         assert!(matches!(outcome, super::FormatOutcome::Formatted(_)));
         let counter = fs::read_to_string(counter_path).unwrap();
         assert_eq!(counter.trim(), "2");
+    }
+
+    #[tokio::test]
+    async fn times_out_when_worker_never_responds() {
+        let workspace_dir = create_prettier_workspace();
+        let workspace = workspace_dir.path();
+        let scratch_dir = tempdir_in(workspace).unwrap();
+        let file_path = scratch_dir.path().join("example.js");
+
+        // A "node" that reads nothing and never replies, so the request round-trip
+        // blocks until the timeout fires.
+        let wrapper_dir = tempdir().unwrap();
+        let wrapper_path = wrapper_dir.path().join("node-wrapper");
+        fs::write(&wrapper_path, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut permissions = fs::metadata(&wrapper_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper_path, permissions).unwrap();
+
+        let formatter =
+            NodePrettierFormatter::new(&wrapper_path).with_request_timeout(Duration::from_millis(250));
+        let error = formatter
+            .format(&file_path, "const answer = 42\n", Some(workspace))
+            .await
+            .unwrap_err();
+
+        assert!(!error.is_unavailable());
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
     }
 
     fn create_prettier_workspace() -> TempDir {
