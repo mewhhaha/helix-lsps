@@ -177,8 +177,13 @@ async function main() {
   });
 
   assert.equal(harness.state.appliedEdits.length, 1);
+  const [documentEdit] = harness.state.appliedEdits[0].documentChanges;
+  assert.deepEqual(documentEdit.textDocument, {
+    uri: documentUri,
+    version: 1,
+  });
   assert.equal(
-    harness.state.appliedEdits[0].changes[documentUri][0].newText,
+    documentEdit.edits[0].newText,
     "const answer = 42;\n",
   );
 
