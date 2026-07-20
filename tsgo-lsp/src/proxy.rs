@@ -467,7 +467,9 @@ impl Proxy {
         let context = match self.discovery.context_for_uri_path(&file_path) {
             Ok(context) => context,
             Err(error) => {
-                self.log_warning(format!("failed to resolve a tsgo session for {uri}: {error:#}"))?;
+                self.log_warning(format!(
+                    "failed to resolve a tsgo session for {uri}: {error:#}"
+                ))?;
                 return Ok(None);
             }
         };

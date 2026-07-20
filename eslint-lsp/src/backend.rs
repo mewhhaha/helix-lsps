@@ -13,13 +13,13 @@ use tower_lsp::{
     jsonrpc::Result,
     lsp_types::{
         CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-        CodeActionProviderCapability, Command, Diagnostic, DiagnosticSeverity, DocumentChanges,
+        CodeActionProviderCapability, Command, Diagnostic, DiagnosticSeverity,
         DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-        DidSaveTextDocumentParams, DocumentFormattingParams, ExecuteCommandOptions,
-        ExecuteCommandParams, InitializeParams, InitializeResult, InitializedParams, MessageType,
-        OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, ServerCapabilities,
-        ServerInfo, TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind,
-        TextDocumentSyncOptions, TextEdit, Url, WorkspaceEdit,
+        DidSaveTextDocumentParams, DocumentChanges, DocumentFormattingParams,
+        ExecuteCommandOptions, ExecuteCommandParams, InitializeParams, InitializeResult,
+        InitializedParams, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
+        Range, ServerCapabilities, ServerInfo, TextDocumentEdit, TextDocumentSyncCapability,
+        TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Url, WorkspaceEdit,
     },
 };
 use tracing::warn;
@@ -363,11 +363,7 @@ impl LanguageServer for Backend {
             ..WorkspaceEdit::default()
         };
 
-        match self
-            .client
-            .apply_edit(workspace_edit)
-            .await
-        {
+        match self.client.apply_edit(workspace_edit).await {
             Ok(response) if response.applied => {}
             Ok(_) => {
                 self.client

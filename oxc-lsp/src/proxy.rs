@@ -693,9 +693,9 @@ impl Proxy {
         // If the target request is still queued (child not yet initialized), the child
         // never saw it, so forwarding the cancel would be a no-op. Drop it from the queue
         // and synthesize a RequestCanceled response for the client instead.
-        if let Some(position) = session.queued_messages.iter().position(|message| {
-            matches!(message, Message::Request(queued) if queued.id == cancelled_id)
-        }) {
+        if let Some(position) = session.queued_messages.iter().position(
+            |message| matches!(message, Message::Request(queued) if queued.id == cancelled_id),
+        ) {
             session.queued_messages.remove(position);
             self.client_request_routes.remove(&cancelled_id);
             self.connection.sender.send(

@@ -299,7 +299,10 @@ fn package_command_from_package_json(
         return Ok(None);
     };
     // Normalize away the leading `./` that npm bin entries conventionally use.
-    let binary = package_dir.join(relative_bin).components().collect::<PathBuf>();
+    let binary = package_dir
+        .join(relative_bin)
+        .components()
+        .collect::<PathBuf>();
 
     Ok(Some(if is_node_entrypoint(&binary) {
         CommandSpec {

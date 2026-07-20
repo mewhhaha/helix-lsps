@@ -470,8 +470,8 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&wrapper_path, permissions).unwrap();
 
-        let formatter =
-            NodePrettierFormatter::new(&wrapper_path).with_request_timeout(Duration::from_millis(250));
+        let formatter = NodePrettierFormatter::new(&wrapper_path)
+            .with_request_timeout(Duration::from_millis(250));
         let error = formatter
             .format(&file_path, "const answer = 42\n", Some(workspace))
             .await

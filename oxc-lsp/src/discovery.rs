@@ -120,7 +120,11 @@ fn discover_local_project(file_path: &Path) -> Result<Option<ProjectContext>> {
         }
 
         if let Some(resolved) = resolve_local_command(candidate, &OXLINT)? {
-            return Ok(Some(project_context(candidate.to_path_buf(), candidate, resolved)?));
+            return Ok(Some(project_context(
+                candidate.to_path_buf(),
+                candidate,
+                resolved,
+            )?));
         }
     }
 
@@ -168,7 +172,11 @@ fn discover_descendant_project(start_dir: &Path) -> Result<Option<ProjectContext
         if candidate.join("package.json").is_file()
             && let Some(resolved) = resolve_local_command(&candidate, &OXLINT)?
         {
-            return Ok(Some(project_context(candidate.clone(), &candidate, resolved)?));
+            return Ok(Some(project_context(
+                candidate.clone(),
+                &candidate,
+                resolved,
+            )?));
         }
 
         if depth >= MAX_DESCENDANT_DEPTH {
@@ -258,11 +266,14 @@ fn resolve_local_command(candidate: &Path, tool: &ToolSpec) -> Result<Option<Res
         .join(tool.package_name)
         .join("package.json");
     if package_json.exists() {
-        return Ok(package_command_from_package_json(candidate, package_json, tool)?
-            .map(|command| ResolvedCommand {
-                command,
-                root: candidate.to_path_buf(),
-            }));
+        return Ok(
+            package_command_from_package_json(candidate, package_json, tool)?.map(|command| {
+                ResolvedCommand {
+                    command,
+                    root: candidate.to_path_buf(),
+                }
+            }),
+        );
     }
 
     let Some(package_json) = resolve_package_json_with_node(candidate, tool.package_name)? else {
@@ -273,14 +284,20 @@ fn resolve_local_command(candidate: &Path, tool: &ToolSpec) -> Result<Option<Res
     // directory owning that `node_modules` rather than the file's own directory.
     let root =
         project_root_from_package_json(&package_json).unwrap_or_else(|| candidate.to_path_buf());
-    Ok(package_command_from_package_json(candidate, package_json, tool)?
-        .map(|command| ResolvedCommand { command, root }))
+    Ok(
+        package_command_from_package_json(candidate, package_json, tool)?
+            .map(|command| ResolvedCommand { command, root }),
+    )
 }
 
 fn project_root_from_package_json(package_json: &Path) -> Option<PathBuf> {
     package_json
         .ancestors()
-        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "node_modules"))
+        .find(|ancestor| {
+            ancestor
+                .file_name()
+                .is_some_and(|name| name == "node_modules")
+        })
         .and_then(Path::parent)
         .map(Path::to_path_buf)
 }

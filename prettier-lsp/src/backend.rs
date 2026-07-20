@@ -101,10 +101,10 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let text_document = params.text_document;
-        self.documents
-            .write()
-            .await
-            .insert(text_document.uri, (text_document.version, text_document.text));
+        self.documents.write().await.insert(
+            text_document.uri,
+            (text_document.version, text_document.text),
+        );
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {

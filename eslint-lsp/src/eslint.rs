@@ -324,7 +324,11 @@ impl Worker {
 
         let bytes_read = match timeout(WORKER_REQUEST_TIMEOUT, exchange).await {
             Ok(result) => result?,
-            Err(_) => return Err(anyhow!("eslint worker timed out while handling the request")),
+            Err(_) => {
+                return Err(anyhow!(
+                    "eslint worker timed out while handling the request"
+                ));
+            }
         };
 
         // A zero-length read is the only reliable signal that the worker closed
@@ -372,7 +376,11 @@ fn bridge_script_path() -> Result<PathBuf> {
     }
 
     let dir = std::env::temp_dir();
-    let target = dir.join(concat!("eslint-lsp-bridge-", env!("CARGO_PKG_VERSION"), ".mjs"));
+    let target = dir.join(concat!(
+        "eslint-lsp-bridge-",
+        env!("CARGO_PKG_VERSION"),
+        ".mjs"
+    ));
     let staging = dir.join(format!(".eslint-lsp-bridge-{}.mjs", std::process::id()));
 
     fs::write(&staging, ESLINT_BRIDGE)
@@ -463,8 +471,7 @@ fn discover_project_roots(start_dir: &Path) -> Result<ProjectRoots> {
             });
         }
 
-        if contains_any(candidate, LEGACY_CONFIG_NAMES)
-            || package_json_has_eslint_config(candidate)
+        if contains_any(candidate, LEGACY_CONFIG_NAMES) || package_json_has_eslint_config(candidate)
         {
             return Ok(ProjectRoots {
                 cwd: candidate.to_path_buf(),
