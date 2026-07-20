@@ -161,6 +161,19 @@ impl Backend {
         self.state.documents.lock().await.insert(uri, document);
     }
 
+    async fn accept_document_change(&self, uri: Url, document: Document) -> bool {
+        let mut documents = self.state.documents.lock().await;
+        if documents
+            .get(&uri)
+            .is_some_and(|current| current.version >= document.version)
+        {
+            return false;
+        }
+
+        documents.insert(uri, document);
+        true
+    }
+
     async fn remove_document(&self, uri: &Url) {
         self.state.documents.lock().await.remove(uri);
         self.state.lint_generations.lock().await.remove(uri);
@@ -284,8 +297,9 @@ impl LanguageServer for Backend {
             text: latest_text,
         };
 
-        self.set_document(uri.clone(), document).await;
-        self.schedule_lint(uri).await;
+        if self.accept_document_change(uri.clone(), document).await {
+            self.schedule_lint(uri).await;
+        }
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {

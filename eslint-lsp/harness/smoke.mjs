@@ -208,6 +208,30 @@ async function main() {
 
   assert.equal(formatting[0].newText, "const answer = 42;\n");
 
+  harness.send({
+    jsonrpc: "2.0",
+    method: "textDocument/didChange",
+    params: {
+      textDocument: { uri: documentUri, version: 3 },
+      contentChanges: [{ text: "const answer = 42;\n" }],
+    },
+  });
+  harness.send({
+    jsonrpc: "2.0",
+    method: "textDocument/didChange",
+    params: {
+      textDocument: { uri: documentUri, version: 2 },
+      contentChanges: [{ text: "const stale = 0\n" }],
+    },
+  });
+
+  const currentFormatting = await harness.request("textDocument/formatting", {
+    textDocument: { uri: documentUri },
+    options: { tabSize: 2, insertSpaces: true },
+  });
+
+  assert.equal(currentFormatting, null);
+
   const workerState = JSON.parse(await readFile(workerStateFile, "utf8"));
   assert.deepEqual(workerState, {
     moduleLoads: 1,
