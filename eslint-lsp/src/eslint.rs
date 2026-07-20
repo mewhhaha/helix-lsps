@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -18,7 +18,7 @@ use tokio::{
 use tracing::warn;
 
 /// Node bridge script, embedded so installed binaries do not depend on the
-/// build-machine source tree. It is materialized to a temp file on first use.
+/// build-machine source tree.
 const ESLINT_BRIDGE: &str = include_str!("../node/eslint-bridge.mjs");
 
 /// Upper bound on a single lint round-trip. A hung eslint config must not wedge
@@ -365,38 +365,12 @@ impl Worker {
     }
 }
 
-/// Materializes the embedded bridge script to a stable temp path once per
-/// process. Writing to a unique temp file and atomically renaming keeps
-/// concurrent worker spawns from observing a half-written script.
-fn bridge_script_path() -> Result<PathBuf> {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-
-    if let Some(path) = PATH.get() {
-        return Ok(path.clone());
-    }
-
-    let dir = std::env::temp_dir();
-    let target = dir.join(concat!(
-        "eslint-lsp-bridge-",
-        env!("CARGO_PKG_VERSION"),
-        ".mjs"
-    ));
-    let staging = dir.join(format!(".eslint-lsp-bridge-{}.mjs", std::process::id()));
-
-    fs::write(&staging, ESLINT_BRIDGE)
-        .with_context(|| format!("failed to write eslint bridge to {}", staging.display()))?;
-    fs::rename(&staging, &target)
-        .with_context(|| format!("failed to install eslint bridge at {}", target.display()))?;
-
-    let _ = PATH.set(target.clone());
-    Ok(target)
-}
-
 fn spawn_worker_process(key: &ProjectKey) -> Result<WorkerProcess> {
-    let bridge_path = bridge_script_path()?;
-
     let mut child = Command::new("node")
-        .arg(bridge_path)
+        .arg("--input-type=module")
+        .arg("--eval")
+        .arg(ESLINT_BRIDGE)
+        .arg("eslint-lsp-bridge")
         .arg(&key.eslint_package_json)
         .arg(&key.cwd)
         .arg(key.config_format.as_bridge_value())
