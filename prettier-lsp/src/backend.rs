@@ -148,13 +148,12 @@ impl LanguageServer for Backend {
             .formatter
             .format(&file_path, &source, workspace_root.as_deref())
             .await;
-        let current_version = self
-            .documents
-            .read()
-            .await
-            .get(&uri)
-            .map(|(version, _)| *version);
-        if current_version != Some(version) {
+        let document_is_current = self.documents.read().await.get(&uri).is_some_and(
+            |(current_version, current_source)| {
+                *current_version == version && current_source == &source
+            },
+        );
+        if !document_is_current {
             return Ok(None);
         }
 

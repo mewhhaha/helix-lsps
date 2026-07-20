@@ -195,7 +195,7 @@ fn ignores_non_increasing_did_change_versions() {
 }
 
 #[test]
-fn declines_edit_when_document_changes_during_formatting() {
+fn declines_edit_when_document_is_reopened_during_formatting() {
     let fixture = tempdir().unwrap();
     let workspace_dir = fixture.path().join("workspace");
     let prettier_dir = workspace_dir.join("node_modules/prettier");
@@ -237,7 +237,13 @@ fn declines_edit_when_document_changes_during_formatting() {
     }
     assert!(formatting_started.exists(), "formatter did not start");
 
-    change_document(&mut harness, &file_path, 2, "v2\n");
+    harness.notify(
+        "textDocument/didClose",
+        json!({
+            "textDocument": { "uri": path_to_url(&file_path).to_string() }
+        }),
+    );
+    open_document(&mut harness, &file_path, "reopened\n");
 
     let formatting = harness.wait_for_response(request_id);
     assert_eq!(formatting["result"], json!(null));
