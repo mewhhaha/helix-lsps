@@ -16,13 +16,6 @@ bundled prettier version.
 
 ## Development
 
-Install the harness dependency once:
-
-```bash
-cd harness/workspace
-npm install
-```
-
 Run the test harness:
 
 ```bash
