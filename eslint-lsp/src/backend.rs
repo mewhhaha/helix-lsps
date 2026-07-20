@@ -214,7 +214,7 @@ impl Backend {
         // The lint ran against a snapshot; if the user edited the document while
         // we were linting, applying this edit would clobber their changes.
         let current = self.get_document(uri).await?;
-        if current.version != document.version {
+        if current.version != document.version || current.text != document.text {
             return None;
         }
 

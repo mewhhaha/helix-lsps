@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -10,6 +10,7 @@ import { createLspHarness } from "./lsp-harness.mjs";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const fixtureRoot = await mkdtemp(path.join(tmpdir(), "eslint-lsp-smoke-"));
 const workerStateFile = path.join(fixtureRoot, "eslint-worker-state.json");
+const fixStartedFile = path.join(fixtureRoot, "eslint-fix-started");
 const targetFile = path.join(fixtureRoot, "src", "example.js");
 
 async function setupFixture() {
@@ -69,6 +70,11 @@ class FakeESLint {
   }
 
   async lintText(text) {
+    if (this.fix && text.includes("slow")) {
+      fs.writeFileSync(${JSON.stringify(fixStartedFile)}, "");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
     const hasSemi = text.trimEnd().endsWith(";");
     const diagnostics = hasSemi
       ? []
@@ -231,6 +237,51 @@ async function main() {
   });
 
   assert.equal(currentFormatting, null);
+
+  harness.send({
+    jsonrpc: "2.0",
+    method: "textDocument/didChange",
+    params: {
+      textDocument: { uri: documentUri, version: 4 },
+      contentChanges: [{ text: "const slow = 1\n" }],
+    },
+  });
+  const staleFormatting = harness.request("textDocument/formatting", {
+    textDocument: { uri: documentUri },
+    options: { tabSize: 2, insertSpaces: true },
+  });
+
+  let fixStarted = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      await access(fixStartedFile);
+      fixStarted = true;
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  assert.equal(fixStarted, true, "ESLint fix did not start");
+
+  harness.send({
+    jsonrpc: "2.0",
+    method: "textDocument/didClose",
+    params: { textDocument: { uri: documentUri } },
+  });
+  harness.send({
+    jsonrpc: "2.0",
+    method: "textDocument/didOpen",
+    params: {
+      textDocument: {
+        uri: documentUri,
+        languageId: "javascript",
+        version: 4,
+        text: "const reopened = 2;\n",
+      },
+    },
+  });
+
+  assert.equal(await staleFormatting, null);
 
   const workerState = JSON.parse(await readFile(workerStateFile, "utf8"));
   assert.deepEqual(workerState, {
