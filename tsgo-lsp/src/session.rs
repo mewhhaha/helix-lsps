@@ -116,6 +116,12 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 fn terminate_child(child: &mut Child) {
     match child.try_wait() {
         Ok(Some(_)) => {}
@@ -202,4 +208,51 @@ fn spawn_stderr_logger(key: SessionKey, stderr: ChildStderr) -> Result<()> {
         .context("failed to spawn tsgo stderr thread")?;
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::discovery::CommandSpec;
+
+    #[test]
+    #[ignore = "spawned by the session lifecycle test"]
+    fn child_process_waits_for_parent() {
+        std::thread::sleep(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn dropping_a_session_terminates_its_child_process() {
+        let (events, _) = crossbeam_channel::unbounded();
+        let session = Session::spawn(
+            ProjectContext {
+                key: SessionKey::Global,
+                root: None,
+                command: CommandSpec {
+                    program: std::env::current_exe().unwrap(),
+                    args: vec![
+                        "--exact".to_owned(),
+                        "session::tests::child_process_waits_for_parent".to_owned(),
+                        "--ignored".to_owned(),
+                    ],
+                    cwd: None,
+                },
+            },
+            events,
+        )
+        .unwrap();
+        let child_id = session.child.id();
+
+        drop(session);
+
+        let status = Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\"", "kill", &child_id.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "child process {child_id} remained alive");
+    }
 }
