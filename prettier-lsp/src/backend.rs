@@ -37,12 +37,12 @@ impl Backend {
         }
     }
 
-    async fn document_text(&self, uri: &Url) -> Option<String> {
+    async fn document_snapshot(&self, uri: &Url) -> Option<(i32, String)> {
         self.documents
             .read()
             .await
             .get(uri)
-            .map(|(_, text)| text.clone())
+            .map(|(version, text)| (*version, text.clone()))
     }
 
     async fn workspace_root_for(&self, file_path: &Path) -> Option<PathBuf> {
@@ -137,18 +137,28 @@ impl LanguageServer for Backend {
         let file_path = uri
             .to_file_path()
             .map_err(|()| Error::invalid_params("prettier-lsp only supports file URIs"))?;
-        let Some(source) = self.document_text(&uri).await else {
+        let Some((version, source)) = self.document_snapshot(&uri).await else {
             // The document is not open; formatting from disk could clobber unsaved
             // editor state, so decline instead of guessing.
             return Ok(None);
         };
         let workspace_root = self.workspace_root_for(&file_path).await;
 
-        match self
+        let outcome = self
             .formatter
             .format(&file_path, &source, workspace_root.as_deref())
+            .await;
+        let current_version = self
+            .documents
+            .read()
             .await
-        {
+            .get(&uri)
+            .map(|(version, _)| *version);
+        if current_version != Some(version) {
+            return Ok(None);
+        }
+
+        match outcome {
             Ok(FormatOutcome::Formatted(formatted)) => {
                 if formatted == source {
                     return Ok(Some(Vec::new()));

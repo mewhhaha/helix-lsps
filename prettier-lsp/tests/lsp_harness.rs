@@ -194,6 +194,57 @@ fn ignores_stale_did_change_with_older_version() {
 }
 
 #[test]
+fn declines_edit_when_document_changes_during_formatting() {
+    let fixture = tempdir().unwrap();
+    let workspace_dir = fixture.path().join("workspace");
+    let prettier_dir = workspace_dir.join("node_modules/prettier");
+    let formatting_started = workspace_dir.join("formatting-started");
+    fs::create_dir_all(&prettier_dir).unwrap();
+    fs::write(
+        prettier_dir.join("package.json"),
+        "{\n  \"name\": \"prettier\",\n  \"version\": \"0.0.0-harness\",\n  \"main\": \"index.cjs\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        prettier_dir.join("index.cjs"),
+        format!(
+            "const fs = require('node:fs');\nmodule.exports = {{\n  getFileInfo: async () => ({{ ignored: false, inferredParser: 'babel' }}),\n  resolveConfig: async () => null,\n  format: async (source) => {{\n    fs.writeFileSync({}, '');\n    await new Promise((resolve) => setTimeout(resolve, 500));\n    return `formatted:${{source}}`;\n  }},\n}};\n",
+            serde_json::to_string(&formatting_started).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let file_path = workspace_dir.join("example.js");
+    fs::write(&file_path, "v1\n").unwrap();
+
+    let mut harness = LspHarness::spawn();
+    initialize_workspace(&mut harness, &workspace_dir);
+    open_document(&mut harness, &file_path, "v1\n");
+
+    let request_id = harness.send_request(
+        "textDocument/formatting",
+        json!({
+            "textDocument": { "uri": path_to_url(&file_path).to_string() },
+            "options": { "tabSize": 2, "insertSpaces": true }
+        }),
+    );
+    for _ in 0..100 {
+        if formatting_started.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(formatting_started.exists(), "formatter did not start");
+
+    change_document(&mut harness, &file_path, 2, "v2\n");
+
+    let formatting = harness.wait_for_response(request_id);
+    assert_eq!(formatting["result"], json!(null));
+
+    harness.shutdown();
+}
+
+#[test]
 fn declines_to_format_unopened_document() {
     let fixture = tempdir().unwrap();
     let workspace_dir = fixture.path().join("workspace");
@@ -412,6 +463,11 @@ impl LspHarness {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send_request(method, params);
+        self.wait_for_response(id)
+    }
+
+    fn send_request(&mut self, method: &str, params: Value) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -422,6 +478,10 @@ impl LspHarness {
             "params": params
         }));
 
+        id
+    }
+
+    fn wait_for_response(&mut self, id: i64) -> Value {
         loop {
             let message = self.read_message();
             if message.get("id") == Some(&json!(id)) {

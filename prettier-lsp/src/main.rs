@@ -14,13 +14,7 @@ async fn main() {
     let (service, socket) =
         LspService::build(|client| Backend::new(client, formatter.clone())).finish();
 
-    // This server has no cancel support, so serializing message handling keeps
-    // document state (didChange) ordered ahead of reads (formatting). Without it
-    // tower-lsp's default buffer_unordered(4) can format against stale text.
-    Server::new(stdin, stdout, socket)
-        .concurrency_level(1)
-        .serve(service)
-        .await;
+    Server::new(stdin, stdout, socket).serve(service).await;
 }
 
 fn init_tracing() {
