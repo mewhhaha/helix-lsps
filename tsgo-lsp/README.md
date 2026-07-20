@@ -1,7 +1,8 @@
 # tsgo-lsp
 
-`tsgo-lsp` is a thin Rust stdio wrapper around the `tsgo --lsp --stdio` command
-from `@typescript/native-preview`.
+`tsgo-lsp` is a thin Rust stdio wrapper around the native TypeScript compiler's
+`--lsp --stdio` mode. It supports both `@typescript/native-preview` and the
+native compiler shipped by TypeScript 7 and newer.
 
 ## Behavior
 
@@ -24,8 +25,12 @@ Discovery prefers, in order:
 
 1. `node_modules/.bin/tsgo`
 2. `node_modules/@typescript/native-preview/package.json`
-3. Node resolution of `@typescript/native-preview/package.json`
-4. Global `tsgo` on `PATH`
+3. `node_modules/typescript/package.json` when its major version is 7 or newer
+4. Node resolution of either supported package
+5. Global `tsgo` on `PATH`
+
+When a package provides a native platform binary, the wrapper launches it
+directly so terminating the LSP session also terminates the compiler process.
 
 ## Testing
 
