@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -239,6 +240,7 @@ pub fn is_tool_unavailable(error: &anyhow::Error) -> bool {
 
 struct Worker {
     key: ProjectKey,
+    node_binary: OsString,
     next_request_id: Mutex<u64>,
     process: Mutex<WorkerProcess>,
 }
@@ -251,10 +253,15 @@ struct WorkerProcess {
 
 impl Worker {
     async fn spawn(key: ProjectKey) -> Result<Self> {
-        let process = spawn_worker_process(&key)?;
+        Self::spawn_with_node(key, "node".into()).await
+    }
+
+    async fn spawn_with_node(key: ProjectKey, node_binary: OsString) -> Result<Self> {
+        let process = spawn_worker_process(&key, &node_binary)?;
 
         Ok(Self {
             key,
+            node_binary,
             next_request_id: Mutex::new(0),
             process: Mutex::new(process),
         })
@@ -268,9 +275,10 @@ impl Worker {
             Err(error) if should_restart_worker_after(&error) => {
                 let _ = process.child.start_kill();
                 let _ = process.child.wait().await;
-                let replacement = spawn_worker_process(&self.key).with_context(|| {
-                    format!("failed to restart eslint worker after request failure: {error}")
-                })?;
+                let replacement =
+                    spawn_worker_process(&self.key, &self.node_binary).with_context(|| {
+                        format!("failed to restart eslint worker after request failure: {error}")
+                    })?;
                 *process = replacement;
 
                 self.lint_with_process(request, &mut process)
@@ -365,8 +373,8 @@ impl Worker {
     }
 }
 
-fn spawn_worker_process(key: &ProjectKey) -> Result<WorkerProcess> {
-    let mut child = Command::new("node")
+fn spawn_worker_process(key: &ProjectKey, node_binary: &OsStr) -> Result<WorkerProcess> {
+    let mut child = Command::new(node_binary)
         .arg("--input-type=module")
         .arg("--eval")
         .arg(ESLINT_BRIDGE)
@@ -498,9 +506,7 @@ fn package_json_has_eslint_config(dir: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::ffi::OsString;
-    use std::{env, fs};
+    use std::fs;
 
     use tempfile::tempdir;
 
@@ -510,19 +516,6 @@ mod tests {
         ConfigFormat, LintRequest, ProjectKey, Worker, discover_project_roots, format_bridge_error,
         is_tool_unavailable, should_restart_worker_after,
     };
-
-    #[cfg(unix)]
-    struct PathRestore(Option<OsString>);
-
-    #[cfg(unix)]
-    impl Drop for PathRestore {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(path) => unsafe { env::set_var("PATH", path) },
-                None => unsafe { env::remove_var("PATH") },
-            }
-        }
-    }
 
     #[test]
     fn prefers_nearest_flat_config() {
@@ -667,22 +660,14 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&node_path, permissions).unwrap();
 
-        let old_path = env::var_os("PATH");
-        let _path_restore = PathRestore(old_path.clone());
-        let mut paths = vec![bin_dir.clone()];
-        if let Some(old_path) = &old_path {
-            paths.extend(env::split_paths(old_path));
-        }
-        let new_path = env::join_paths(paths).unwrap();
-        unsafe {
-            env::set_var("PATH", new_path);
-        }
-
-        let worker = Worker::spawn(ProjectKey {
-            cwd: project.clone(),
-            config_format: ConfigFormat::Default,
-            eslint_package_json: project.join("node_modules/eslint/package.json"),
-        })
+        let worker = Worker::spawn_with_node(
+            ProjectKey {
+                cwd: project.clone(),
+                config_format: ConfigFormat::Default,
+                eslint_package_json: project.join("node_modules/eslint/package.json"),
+            },
+            node_path.into_os_string(),
+        )
         .await
         .unwrap();
         let response = worker
