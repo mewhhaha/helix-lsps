@@ -76,7 +76,7 @@ async function handleRequest(line) {
         line: message.line ?? 1,
         column: message.column ?? 1,
         endLine: message.endLine ?? message.line ?? 1,
-        endColumn: message.endColumn ?? message.column ?? 1,
+        endColumn: message.endColumn ?? (message.column ?? 1) + 1,
       })),
       fixedText: typeof result.output === "string" ? result.output : null,
     };

@@ -78,8 +78,6 @@ class FakeESLint {
           message: "Missing semicolon.",
           line: 1,
           column: Math.max(text.replace(/\\n$/, "").length + 1, 1),
-          endLine: 1,
-          endColumn: Math.max(text.replace(/\\n$/, "").length + 1, 1),
         }];
 
     return [{
@@ -146,6 +144,10 @@ async function main() {
   const diagnostics = await harness.waitForDiagnostics(documentUri);
   assert.equal(diagnostics.diagnostics.length, 1);
   assert.equal(diagnostics.diagnostics[0].code, "semi");
+  assert.equal(
+    diagnostics.diagnostics[0].range.end.character,
+    diagnostics.diagnostics[0].range.start.character + 1,
+  );
 
   const actions = await Promise.race([
     harness.request("textDocument/codeAction", {
