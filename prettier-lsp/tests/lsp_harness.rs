@@ -171,7 +171,7 @@ fn does_not_escape_initialized_workspace_when_resolving_prettier() {
 }
 
 #[test]
-fn ignores_stale_did_change_with_older_version() {
+fn ignores_non_increasing_did_change_versions() {
     let fixture = tempdir().unwrap();
     let workspace_dir = fixture.path().join("workspace");
     fs::create_dir_all(&workspace_dir).unwrap();
@@ -184,8 +184,9 @@ fn ignores_stale_did_change_with_older_version() {
     initialize_workspace(&mut harness, &workspace_dir);
     open_document(&mut harness, &file_path, "v1\n");
     change_document(&mut harness, &file_path, 3, "v3\n");
-    // Arrives late and behind the version we already hold, so it must be dropped.
+    // Neither an older nor a duplicate version may replace the current snapshot.
     change_document(&mut harness, &file_path, 2, "stale\n");
+    change_document(&mut harness, &file_path, 3, "same-version stale\n");
 
     let formatting = format_document(&mut harness, &file_path);
     assert_eq!(formatting["result"][0]["newText"], json!("formatted:v3\n"));

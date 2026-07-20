@@ -115,10 +115,10 @@ impl LanguageServer for Backend {
         let version = params.text_document.version;
 
         let mut documents = self.documents.write().await;
-        // Drop changes that arrive out of order behind a newer version we already hold.
+        // LSP document versions must advance monotonically.
         if documents
             .get(&uri)
-            .is_some_and(|(current, _)| *current > version)
+            .is_some_and(|(current, _)| *current >= version)
         {
             return;
         }
