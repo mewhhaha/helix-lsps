@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, VecDeque},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -219,8 +221,19 @@ fn should_skip_descendant(path: &Path) -> bool {
 }
 
 fn discover_global_fallback(file_path: &Path) -> Result<Option<ProjectContext>> {
+    let search_path = env::var_os("PATH");
+    discover_global_fallback_in_path(file_path, search_path.as_deref())
+}
+
+fn discover_global_fallback_in_path(
+    file_path: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<Option<ProjectContext>> {
     let _cwd = normalize_start_dir(file_path)?;
-    let Some(lint_command) = resolve_global_command(&OXLINT) else {
+    let Some(search_path) = search_path else {
+        return Ok(None);
+    };
+    let Some(lint_command) = resolve_global_command_in_path(&OXLINT, search_path) else {
         return Ok(None);
     };
 
@@ -228,7 +241,7 @@ fn discover_global_fallback(file_path: &Path) -> Result<Option<ProjectContext>> 
         key: SessionKey::Global,
         root: None,
         lint_command,
-        format_command: resolve_global_command(&OXFMT),
+        format_command: resolve_global_command_in_path(&OXFMT, search_path),
     }))
 }
 
@@ -382,11 +395,20 @@ fn resolve_package_json_with_node(candidate: &Path, package_name: &str) -> Resul
 }
 
 fn resolve_global_command(tool: &ToolSpec) -> Option<CommandSpec> {
-    find_in_path(executable_name(tool.executable_name)).map(|program| CommandSpec {
-        program,
-        args: tool.args.iter().map(|arg| (*arg).to_owned()).collect(),
-        cwd: None,
-    })
+    let search_path = env::var_os("PATH")?;
+    resolve_global_command_in_path(tool, &search_path)
+}
+
+fn resolve_global_command_in_path(tool: &ToolSpec, search_path: &OsStr) -> Option<CommandSpec> {
+    let binary_name = executable_name(tool.executable_name);
+    env::split_paths(search_path)
+        .map(|dir| dir.join(&binary_name))
+        .find(|candidate| candidate.is_file())
+        .map(|program| CommandSpec {
+            program,
+            args: tool.args.iter().map(|arg| (*arg).to_owned()).collect(),
+            cwd: None,
+        })
 }
 
 fn is_node_entrypoint(path: &Path) -> bool {
@@ -404,24 +426,18 @@ fn executable_name(base: &str) -> String {
     }
 }
 
-fn find_in_path(binary_name: String) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-
-    env::split_paths(&path)
-        .map(|dir| dir.join(&binary_name))
-        .find(|candidate| candidate.is_file())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
-        env, fs,
+        fs,
         path::{Path, PathBuf},
     };
 
     use tempfile::tempdir;
 
-    use super::{Discovery, SessionKey, project_root_from_package_json};
+    use super::{
+        Discovery, SessionKey, discover_global_fallback_in_path, project_root_from_package_json,
+    };
 
     #[test]
     fn derives_project_root_from_resolved_package_location() {
@@ -507,20 +523,10 @@ mod tests {
         fs::write(bin_dir.join("oxlint"), "#!/bin/sh\n").unwrap();
         fs::write(bin_dir.join("oxfmt"), "#!/bin/sh\n").unwrap();
 
-        let old_path = env::var_os("PATH");
-        unsafe {
-            env::set_var("PATH", &bin_dir);
-        }
-
-        let mut discovery = Discovery::default();
-        let context = discovery
-            .context_for_uri_path(&source.join("index.ts"))
-            .unwrap();
-
-        match old_path {
-            Some(path) => unsafe { env::set_var("PATH", path) },
-            None => unsafe { env::remove_var("PATH") },
-        }
+        let context =
+            discover_global_fallback_in_path(&source.join("index.ts"), Some(bin_dir.as_os_str()))
+                .unwrap()
+                .unwrap();
 
         assert_eq!(context.key, SessionKey::Global);
         assert!(context.lint_command.program.ends_with("oxlint"));

@@ -1,6 +1,8 @@
 use std::{
     collections::VecDeque,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -189,8 +191,22 @@ fn enqueue_child_directories(dir: &Path, queue: &mut VecDeque<PathBuf>) {
 }
 
 fn discover_global_fallback(file_path: &Path) -> Result<ProjectContext> {
+    let search_path = env::var_os("PATH");
+    discover_global_fallback_in_path(file_path, search_path.as_deref())
+}
+
+fn discover_global_fallback_in_path(
+    file_path: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<ProjectContext> {
     let cwd = normalize_start_dir(file_path)?;
-    let Some(program) = find_in_path(executable_name("tsgo")) else {
+    let binary_name = executable_name("tsgo");
+    let program = search_path.and_then(|search_path| {
+        env::split_paths(search_path)
+            .map(|dir| dir.join(&binary_name))
+            .find(|candidate| candidate.is_file())
+    });
+    let Some(program) = program else {
         return Err(anyhow!(
             "could not find a local {NATIVE_PREVIEW_PACKAGE} or {TYPESCRIPT_PACKAGE} (>= {MINIMUM_TYPESCRIPT_MAJOR}) installation for {} and no global tsgo was available on PATH",
             file_path.display()
@@ -450,21 +466,16 @@ fn executable_name(base: &str) -> String {
     }
 }
 
-fn find_in_path(binary_name: String) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-
-    env::split_paths(&path)
-        .map(|dir| dir.join(&binary_name))
-        .find(|candidate| candidate.is_file())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, path::PathBuf};
+    use std::{fs, path::PathBuf};
 
     use tempfile::tempdir;
 
-    use super::{Discovery, SessionKey, node_arch, node_platform, resolve_local_command};
+    use super::{
+        Discovery, SessionKey, discover_global_fallback_in_path, node_arch, node_platform,
+        resolve_local_command,
+    };
 
     #[test]
     fn prefers_nearest_package_with_local_tsgo() {
@@ -499,20 +510,9 @@ mod tests {
         fs::create_dir_all(&bin_dir).unwrap();
         fs::write(bin_dir.join("tsgo"), "#!/bin/sh\n").unwrap();
 
-        let old_path = env::var_os("PATH");
-        unsafe {
-            env::set_var("PATH", &bin_dir);
-        }
-
-        let discovery = Discovery;
-        let context = discovery
-            .context_for_uri_path(&source.join("index.ts"))
-            .unwrap();
-
-        match old_path {
-            Some(path) => unsafe { env::set_var("PATH", path) },
-            None => unsafe { env::remove_var("PATH") },
-        }
+        let context =
+            discover_global_fallback_in_path(&source.join("index.ts"), Some(bin_dir.as_os_str()))
+                .unwrap();
 
         assert_eq!(context.key, SessionKey::Global);
         assert!(context.command.program.ends_with("tsgo"));
