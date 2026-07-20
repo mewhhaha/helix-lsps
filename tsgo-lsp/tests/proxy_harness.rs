@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use lsp_server::{Message, Notification, Request, RequestId, Response};
+use lsp_server::{ErrorCode, Message, Notification, Request, RequestId, Response};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use url::Url;
@@ -473,6 +473,65 @@ fn returns_error_when_secondary_project_init_fails() -> Result<()> {
     let response = harness.expect_response(RequestId::from(2))?;
     let error = response.error.expect("hover should fail");
     assert!(error.message.contains("project-b failed to initialize"));
+
+    Ok(())
+}
+
+#[test]
+fn cancels_request_queued_behind_secondary_project_initialization() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path();
+    let fake_tsgo = Path::new(env!("CARGO_BIN_EXE_fake-tsgo"));
+
+    let project_a = create_project(root, "project-a", fake_tsgo)?;
+    let project_b = create_project_with_env(
+        root,
+        "project-b",
+        fake_tsgo,
+        &[("TSGO_FAKE_INIT_DELAY_MS", "500")],
+    )?;
+
+    let mut harness = Harness::spawn(Path::new(env!("CARGO_BIN_EXE_tsgo-lsp")))?;
+    let project_a_uri = file_url(&project_a)?;
+    let file_b_uri = file_url(&project_b.join("src/index.ts"))?;
+
+    harness.send(Request::new(
+        RequestId::from(1),
+        "initialize".into(),
+        json!({
+            "processId": std::process::id(),
+            "rootUri": project_a_uri,
+            "capabilities": {}
+        }),
+    ))?;
+    harness.expect_response(RequestId::from(1))?;
+    harness.send(Notification::new("initialized".into(), json!({})))?;
+
+    harness.send(Request::new(
+        RequestId::from(2),
+        "textDocument/hover".into(),
+        json!({
+            "textDocument": {"uri": file_b_uri},
+            "position": {"line": 0, "character": 0}
+        }),
+    ))?;
+    harness.send(Notification::new(
+        "$/cancelRequest".into(),
+        json!({"id": 2}),
+    ))?;
+
+    let response = harness.expect_response(RequestId::from(2))?;
+    let error = response.error.expect("queued hover should be cancelled");
+    assert_eq!(error.code, ErrorCode::RequestCanceled as i32);
+
+    harness.send(Request::new(
+        RequestId::from(3),
+        "shutdown".into(),
+        json!(null),
+    ))?;
+    harness.expect_response(RequestId::from(3))?;
+    harness.send(Notification::new("exit".into(), json!(null)))?;
+    harness.wait()?;
 
     Ok(())
 }

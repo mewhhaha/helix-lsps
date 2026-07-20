@@ -24,6 +24,9 @@ fn run() -> Result<()> {
 
     let label = std::env::var("TSGO_FAKE_LABEL").unwrap_or_else(|_| session_label_from_cwd());
     let init_error = std::env::var("TSGO_FAKE_INIT_ERROR").ok();
+    let init_delay_ms = std::env::var("TSGO_FAKE_INIT_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
     let exit_on_hover = std::env::var_os("TSGO_FAKE_EXIT_ON_HOVER").is_some();
     let empty_hover_response = std::env::var_os("TSGO_FAKE_EMPTY_HOVER_RESPONSE").is_some();
     let shutdown_delay_ms = std::env::var("TSGO_FAKE_SHUTDOWN_DELAY_MS")
@@ -38,6 +41,10 @@ fn run() -> Result<()> {
         match message {
             Message::Request(request) => {
                 if request.method == "initialize" {
+                    if let Some(delay_ms) = init_delay_ms {
+                        thread::sleep(Duration::from_millis(delay_ms));
+                    }
+
                     if let Some(message) = &init_error {
                         let response = Response::new_err(
                             request.id,

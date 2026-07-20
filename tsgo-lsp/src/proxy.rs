@@ -585,7 +585,7 @@ impl Proxy {
         }
     }
 
-    fn handle_cancel_notification(&self, notification: &Notification) -> Result<()> {
+    fn handle_cancel_notification(&mut self, notification: &Notification) -> Result<()> {
         let Some(cancelled_id) = notification
             .params
             .get("id")
@@ -594,12 +594,28 @@ impl Proxy {
             return Ok(());
         };
 
-        let Some(session_key) = self.client_request_routes.get(&cancelled_id) else {
+        let Some(session_key) = self.client_request_routes.get(&cancelled_id).cloned() else {
             return Ok(());
         };
-        let Some(session) = self.sessions.get(session_key) else {
+        let Some(session) = self.sessions.get_mut(&session_key) else {
             return Ok(());
         };
+
+        if let Some(position) = session.queued_messages.iter().position(
+            |message| matches!(message, Message::Request(queued) if queued.id == cancelled_id),
+        ) {
+            session.queued_messages.remove(position);
+            self.client_request_routes.remove(&cancelled_id);
+            self.connection.sender.send(
+                Response::new_err(
+                    cancelled_id,
+                    ErrorCode::RequestCanceled as i32,
+                    "request cancelled".to_owned(),
+                )
+                .into(),
+            )?;
+            return Ok(());
+        }
 
         session.send(notification.clone().into())?;
 
