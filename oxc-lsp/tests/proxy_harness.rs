@@ -466,6 +466,81 @@ fn survives_child_spawn_failure() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn keeps_linting_when_formatter_cannot_spawn() -> Result<()> {
+    let temp = tempdir()?;
+    let root = temp.path();
+    let fake_oxlint = Path::new(env!("CARGO_BIN_EXE_fake-oxlint"));
+    let fake_oxfmt = Path::new(env!("CARGO_BIN_EXE_fake-oxfmt"));
+    let project = create_project(root, "project", fake_oxlint, fake_oxfmt)?;
+    let formatter = project.join("node_modules/.bin/oxfmt");
+    let mut permissions = fs::metadata(&formatter)?.permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&formatter, permissions)?;
+
+    let file = project.join("src/index.ts");
+    let file_uri = file_url(&file)?;
+    let project_uri = file_url(&project)?;
+    let mut harness = Harness::spawn(Path::new(env!("CARGO_BIN_EXE_oxc-lsp")))?;
+
+    harness.send(Request::new(
+        RequestId::from(1),
+        "initialize".into(),
+        json!({
+            "processId": std::process::id(),
+            "rootUri": project_uri,
+            "capabilities": {}
+        }),
+    ))?;
+    let initialize = harness.expect_response(RequestId::from(1))?;
+    assert!(initialize.result.as_ref().is_some_and(|result| {
+        result
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("documentFormattingProvider"))
+            .is_none()
+    }));
+    harness.send(Notification::new("initialized".into(), json!({})))?;
+
+    harness.send(Notification::new(
+        "textDocument/didOpen".into(),
+        json!({
+            "textDocument": {
+                "uri": file_uri.clone(),
+                "languageId": "typescript",
+                "version": 1,
+                "text": "export const value = 1;\n"
+            }
+        }),
+    ))?;
+    let diagnostics = harness.expect_diagnostics(&file_uri)?;
+    assert_eq!(
+        first_diagnostic_message(&diagnostics),
+        "lint-session=project"
+    );
+
+    harness.send(Request::new(
+        RequestId::from(2),
+        "textDocument/formatting".into(),
+        json!({
+            "textDocument": {"uri": file_uri},
+            "options": {"tabSize": 2, "insertSpaces": true}
+        }),
+    ))?;
+    let formatting = harness.expect_response(RequestId::from(2))?;
+    assert_eq!(formatting.result, Some(json!([])));
+
+    harness.send(Request::new(
+        RequestId::from(3),
+        "shutdown".into(),
+        json!(null),
+    ))?;
+    harness.expect_response(RequestId::from(3))?;
+    harness.send(Notification::new("exit".into(), json!(null)))?;
+    harness.wait()?;
+
+    Ok(())
+}
+
 fn create_project(
     root: &Path,
     name: &str,

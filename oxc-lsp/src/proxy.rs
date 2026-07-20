@@ -336,10 +336,6 @@ impl Proxy {
             .ok_or_else(|| anyhow!("default lint session disappeared during initialize"))?
             .send(initialize.into())?;
 
-        if context.format_command.is_some() {
-            self.ensure_formatter_initialized(&context)?;
-        }
-
         Ok(())
     }
 
@@ -507,8 +503,8 @@ impl Proxy {
             send_initialize,
         )?;
 
-        if context.format_command.is_some() {
-            self.ensure_formatter_initialized(context)?;
+        if let Err(error) = self.ensure_formatter_initialized(context) {
+            self.log_warning(format!("failed to start oxfmt session: {error}"))?;
         }
 
         Ok(())
